@@ -1,0 +1,21 @@
+# Copy to config.toml and fill in real values. config.toml is gitignored.
+
+listen = "0.0.0.0:8080"
+data_dir = "data"
+site_name = "Litemetica Share Hub"
+
+[sso]
+base_url = "https://sso.cxu.org.cn"
+client_id = "replace-me"
+client_secret = "replace-me"
+redirect_uri = "http://localhost:8080/oauth/callback"
+
+[limits]
+# Anonymous download quota per IP within the time window.
+download_per_ip = 3
+download_window_secs = 60
+max_upload_mb = 64
+# Minimum RMSSSO permission_level required to upload schematics.
+min_permission_level = 1
+# Set true only when running behind a reverse proxy that sets X-Forwarded-For.
+trust_x_forwarded_for = false

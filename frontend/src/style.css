@@ -1,0 +1,169 @@
+/* App-level layout on top of zhimo-ui tokens. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+#app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.page {
+  width: min(1100px, 100% - 2.5rem);
+  margin: 1.5rem auto;
+  flex: 1;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+.toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+
+.toolbar .spacer {
+  flex: 1;
+}
+
+.muted {
+  color: var(--zhimo-ink-soft, #6b6257);
+  font-size: 0.85rem;
+}
+
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.meta-item {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--zhimo-line, #d8d0c4);
+  border-radius: var(--zhimo-radius, 8px);
+}
+
+.meta-item .label {
+  font-size: 0.75rem;
+  color: var(--zhimo-ink-soft, #6b6257);
+}
+
+.meta-item .value {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Generic data table used by the material list (zhimo-ui has no table component). */
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--zhimo-line, #e2dcd2);
+}
+
+.data-table th {
+  font-size: 0.78rem;
+  color: var(--zhimo-ink-soft, #6b6257);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.data-table tbody tr:hover {
+  background: var(--zhimo-paper-raised, rgba(0, 0, 0, 0.03));
+}
+
+.block-icon {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  image-rendering: pixelated;
+  vertical-align: middle;
+  border-radius: 3px;
+}
+
+.file-drop {
+  border: 2px dashed var(--zhimo-line, #cfc6b8);
+  border-radius: var(--zhimo-radius, 10px);
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.file-drop.dragover {
+  border-color: var(--zhimo-seal, #b3452c);
+  background: rgba(179, 69, 44, 0.05);
+}
+
+.file-drop.has-file {
+  border-style: solid;
+}
+
+.viewer-shell {
+  position: relative;
+  border: 1px solid var(--zhimo-line, #d8d0c4);
+  border-radius: var(--zhimo-radius, 10px);
+  overflow: hidden;
+  background: var(--zhimo-paper, #f6f2e9);
+  height: min(64vh, 620px);
+}
+
+.viewer-shell canvas {
+  display: block;
+}
+
+.viewer-tip {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.5rem;
+  font-size: 0.72rem;
+  color: var(--zhimo-ink-soft, #8a8175);
+  background: rgba(246, 242, 233, 0.75);
+  padding: 0.15rem 0.5rem;
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.user-chip img {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+}
+
+.auth-panel {
+  max-width: 420px;
+  margin: 3rem auto;
+  text-align: center;
+}
+
+[data-theme='dark'] .data-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.04);
+}

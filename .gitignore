@@ -1,0 +1,18 @@
+# Rust
+backend/target/
+
+# Node
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+*.tsbuildinfo
+
+# Runtime data (db, uploaded schematics, previews, extracted textures, jars)
+/data/
+
+# Local config with secrets
+config.toml
+
+# Editor/OS
+.DS_Store
+*.swp
