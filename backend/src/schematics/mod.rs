@@ -390,3 +390,140 @@ pub async fn delete(
     state.storage.delete_all(&id);
     Ok(Json(json!({ "ok": true })))
 }
+
+/// Outcome of a `regen-previews` run over all stored schematics.
+#[derive(Debug, Default)]
+pub struct RegenReport {
+    /// Ids whose preview payloads were rewritten.
+    pub regenerated: Vec<String>,
+    /// Ids that failed, with the error message.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Re-parse every stored `.litematic` and rewrite its cached preview payload
+/// with the current format (used to migrate previews after schema changes).
+/// A failing schematic is recorded and skipped; the rest are still processed.
+pub fn regen_previews(storage: &storage::Storage) -> std::io::Result<RegenReport> {
+    let mut report = RegenReport::default();
+    for id in storage.schematic_ids()? {
+        match regen_preview(storage, &id) {
+            Ok(()) => report.regenerated.push(id),
+            Err(err) => report.failed.push((id, err)),
+        }
+    }
+    Ok(report)
+}
+
+fn regen_preview(storage: &storage::Storage, id: &str) -> Result<(), String> {
+    let bytes = storage
+        .read_schematic(id)
+        .map_err(|e| format!("cannot read schematic: {e}"))?;
+    let parsed = parse::parse_litematic(&bytes)?;
+    let value = serde_json::to_value(&parsed.preview)
+        .map_err(|e| format!("cannot serialize preview: {e}"))?;
+    storage
+        .store_preview(id, &value)
+        .map_err(|e| format!("cannot write preview: {e}"))
+}
+
+#[cfg(test)]
+mod regen_tests {
+    use super::{parse, regen_previews};
+    use crate::schematics::storage::Storage;
+    use mcdata::util::BlockPos;
+    use mcdata::{BlockState, GenericBlockState};
+    use rustmatica::{Litematic, Region};
+
+    fn temp_storage(tag: &str) -> (Storage, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lsh-regen-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        (Storage::new(&dir).expect("create storage"), dir)
+    }
+
+    fn redstone_wire(power: &str) -> GenericBlockState {
+        let props: Vec<(std::borrow::Cow<'static, str>, std::borrow::Cow<'static, str>)> = vec![
+            ("north".to_string().into(), "up".to_string().into()),
+            ("east".to_string().into(), "side".to_string().into()),
+            ("south".to_string().into(), "side".to_string().into()),
+            ("west".to_string().into(), "side".to_string().into()),
+            ("power".to_string().into(), power.to_string().into()),
+        ];
+        GenericBlockState {
+            name: "minecraft:redstone_wire".to_string().into(),
+            properties: props.into_iter().collect(),
+        }
+    }
+
+    fn litematic_bytes() -> Vec<u8> {
+        let mut schem: Litematic<
+            GenericBlockState,
+            mcdata::GenericEntity,
+            mcdata::GenericBlockEntity,
+        > = Litematic::new("regen", "regen test", "tester");
+        schem.metadata.minecraft_data_version = 3700;
+        let mut region: Region<
+            GenericBlockState,
+            mcdata::GenericEntity,
+            mcdata::GenericBlockEntity,
+        > = Region::new("main", BlockPos::new(0, 0, 0), BlockPos::new(2, 1, 1));
+        region.set_block(BlockPos::new(0, 0, 0), redstone_wire("7"));
+        region.set_block(BlockPos::new(1, 0, 0), GenericBlockState::air());
+        schem.regions.push(region);
+        schem.to_bytes().expect("serialize litematic")
+    }
+
+    #[test]
+    fn schematic_ids_lists_only_litematic_files_sorted() {
+        let (storage, dir) = temp_storage("ids");
+        storage.store_schematic("bbb", b"x").unwrap();
+        storage.store_schematic("aaa", b"x").unwrap();
+        std::fs::write(dir.join("schematics/notes.txt"), b"junk").unwrap();
+        std::fs::write(dir.join("schematics/partial.json.gz.tmp"), b"junk").unwrap();
+
+        let ids = storage.schematic_ids().unwrap();
+        assert_eq!(ids, vec!["aaa".to_string(), "bbb".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regen_rewrites_previews_and_continues_past_failures() {
+        let (storage, dir) = temp_storage("run");
+        let bytes = litematic_bytes();
+        storage.store_schematic("good1", &bytes).unwrap();
+        storage.store_schematic("bad", b"not a litematic").unwrap();
+        storage.store_schematic("good2", &bytes).unwrap();
+
+        let report = regen_previews(&storage).unwrap();
+        assert_eq!(
+            report.regenerated,
+            vec!["good1".to_string(), "good2".to_string()]
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "bad");
+        assert!(
+            report.failed[0].1.contains("litematic"),
+            "error should explain the parse failure, got: {}",
+            report.failed[0].1
+        );
+
+        // Rewritten previews decode to schema 2 and keep the full state string.
+        for id in ["good1", "good2"] {
+            let raw = storage.read_preview(id).unwrap();
+            let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
+            let json: serde_json::Value = serde_json::from_reader(&mut decoder).unwrap();
+            assert_eq!(json["schema"], parse::PREVIEW_SCHEMA_VERSION);
+            let palette = json["regions"][0]["palette"].as_array().unwrap();
+            let states: Vec<&str> = palette.iter().filter_map(|v| v.as_str()).collect();
+            assert!(states.contains(&"minecraft:air"));
+            assert!(states.contains(
+                &"minecraft:redstone_wire[east=side,north=up,power=7,south=side,west=side]"
+            ));
+        }
+        // The failing schematic keeps no preview file.
+        assert!(storage.read_preview("bad").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -50,10 +50,38 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some("regen-previews") => {
+            let config = load_config();
+            let data_dir = resolve_data_dir(&config);
+            let storage =
+                schematics::storage::Storage::new(&data_dir).expect("create storage dirs");
+            match schematics::regen_previews(&storage) {
+                Ok(report) => {
+                    for id in &report.regenerated {
+                        println!("regenerated preview for {id}");
+                    }
+                    for (id, err) in &report.failed {
+                        eprintln!("failed to regenerate preview for {id}: {err}");
+                    }
+                    println!(
+                        "regen-previews: {} regenerated, {} failed",
+                        report.regenerated.len(),
+                        report.failed.len()
+                    );
+                    if !report.failed.is_empty() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("regen-previews failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: litemetica-share-hub [serve] | extract-textures [--version X] [--jar PATH]"
+                "usage: litemetica-share-hub [serve] | extract-textures [--version X] [--jar PATH] | regen-previews"
             );
             std::process::exit(2);
         }
@@ -111,7 +139,7 @@ async fn serve() {
         )
         .route("/schematics/{id}/preview", get(schematics::preview))
         .route("/schematics/{id}/download", get(schematics::download))
-        .route("/textures/manifest", get(textures::serve_manifest))
+        .route("/textures/bundle", get(textures::serve_bundle))
         .route("/textures/{name}", get(textures::serve_atlas));
 
     let app = Router::new()

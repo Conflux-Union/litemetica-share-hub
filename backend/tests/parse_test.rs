@@ -14,6 +14,20 @@ fn block(name: &str) -> GenericBlockState {
     }
 }
 
+fn redstone_wire() -> GenericBlockState {
+    let props: Vec<(std::borrow::Cow<'static, str>, std::borrow::Cow<'static, str>)> = vec![
+        ("north".to_string().into(), "up".to_string().into()),
+        ("east".to_string().into(), "side".to_string().into()),
+        ("south".to_string().into(), "side".to_string().into()),
+        ("west".to_string().into(), "side".to_string().into()),
+        ("power".to_string().into(), "7".to_string().into()),
+    ];
+    GenericBlockState {
+        name: "minecraft:redstone_wire".to_string().into(),
+        properties: props.into_iter().collect(),
+    }
+}
+
 fn build_test_litematic() -> Litematic {
     let mut schem = Litematic::new("测试原理图", "集成测试描述", "tester");
     schem.metadata.minecraft_data_version = 3700; // 1.20.4
@@ -27,6 +41,7 @@ fn build_test_litematic() -> Litematic {
                     (2, 0, 0) => block("minecraft:carrots"),
                     (3, 0, 0) => block("minecraft:water"), // excluded from materials
                     (0, 0, 1) => block("minecraft:stone"),
+                    (2, 1, 0) => redstone_wire(),
                     _ => GenericBlockState::air(),
                 };
                 region.set_block(BlockPos::new(x, y, z), b);
@@ -52,8 +67,8 @@ fn parse_pipeline_roundtrip() {
     assert_eq!(parsed.litematica_version, 6);
     assert_eq!((parsed.width, parsed.height, parsed.depth), (4, 3, 2));
     assert_eq!(parsed.region_count, 1);
-    // stone x2 + oak_wall_sign + carrots (water and air excluded)
-    assert_eq!(parsed.total_blocks, 4);
+    // stone x2 + oak_wall_sign + carrots + redstone_wire (water and air excluded)
+    assert_eq!(parsed.total_blocks, 5);
 
     let by_id = |id: &str| {
         parsed
@@ -74,6 +89,8 @@ fn parse_pipeline_roundtrip() {
         "carrots maps to carrot item"
     );
     assert!(by_id("minecraft:water").is_none(), "water excluded");
+    // The state-carrying wire still maps to the bare-name redstone item.
+    assert_eq!(by_id("minecraft:redstone"), Some(1));
     assert!(parsed.materials.iter().all(|m| !m.name_zh.is_empty()));
 
     // RLE roundtrip: expand and compare block-by-block against the source region.
@@ -97,6 +114,11 @@ fn parse_pipeline_roundtrip() {
     assert_eq!(expanded[lookup(2, 0, 0)], "minecraft:carrots");
     assert_eq!(expanded[lookup(3, 0, 0)], "minecraft:water");
     assert_eq!(expanded[lookup(0, 0, 1)], "minecraft:stone");
+    // Property-carrying blocks expand to canonical state strings.
+    assert_eq!(
+        expanded[lookup(2, 1, 0)],
+        "minecraft:redstone_wire[east=side,north=up,power=7,south=side,west=side]"
+    );
     assert_eq!(expanded[lookup(1, 1, 0)], "minecraft:air");
     assert_eq!(expanded[lookup(3, 2, 1)], "minecraft:air");
 

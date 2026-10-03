@@ -1,9 +1,14 @@
+use mcdata::GenericBlockState;
 use rustmatica::Litematic;
 use serde::Serialize;
 use std::collections::HashMap;
 
 pub const MC_DATA_VERSIONS: &str = include_str!("../data/mc_data_versions.json");
 pub const BLOCK_NAMES_ZH_CN: &str = include_str!("../data/block_names_zh_cn.json");
+
+/// Preview payload schema version.
+/// 1 = palette carried bare block ids; 2 = palette carries full state strings.
+pub const PREVIEW_SCHEMA_VERSION: u32 = 2;
 
 /// Map a Minecraft data version to the release it belongs to (or the closest older release).
 pub fn mc_version_name(data_version: i64) -> String {
@@ -35,7 +40,8 @@ pub struct RegionPreview {
     pub name: String,
     pub pos: [i64; 3],
     pub size: [i64; 3],
-    /// Block ids (properties stripped), aligned with RLE palette indices.
+    /// Canonical full-state strings `name[k=v,...]` (properties sorted by key),
+    /// aligned with RLE palette indices. Property-less blocks keep the bare name.
     pub palette: Vec<String>,
     /// Run-length encoding in block iteration order (x fastest, then z, then y).
     pub rle: Vec<[u64; 2]>,
@@ -43,6 +49,7 @@ pub struct RegionPreview {
 
 #[derive(Debug, Serialize)]
 pub struct PreviewData {
+    pub schema: u32,
     pub size: [i64; 3],
     pub regions: Vec<RegionPreview>,
 }
@@ -62,6 +69,43 @@ pub struct ParsedSchematic {
     pub total_blocks: u64,
     pub materials: Vec<MaterialEntry>,
     pub preview: PreviewData,
+}
+
+/// Format a block state as the canonical state string `name[k=v,...]` with
+/// properties sorted by key, so equal states always serialize identically.
+/// Blocks without properties serialize as the bare block name.
+fn state_key(block: &GenericBlockState) -> String {
+    if block.properties.is_empty() {
+        return block.name.clone().into_owned();
+    }
+    let mut props: Vec<(&str, &str)> = block
+        .properties
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .collect();
+    props.sort_unstable();
+    let mut key = String::with_capacity(block.name.len() + props.len() * 8);
+    key.push_str(&block.name);
+    key.push('[');
+    for (i, (k, v)) in props.iter().enumerate() {
+        if i > 0 {
+            key.push(',');
+        }
+        key.push_str(k);
+        key.push('=');
+        key.push_str(v);
+    }
+    key.push(']');
+    key
+}
+
+/// Strip the `[k=v,...]` property section from a state string, returning the
+/// bare block name that material/stat helpers expect.
+fn bare_block_name(state: &str) -> &str {
+    match state.find('[') {
+        Some(i) => &state[..i],
+        None => state,
+    }
 }
 
 /// Blocks that never appear in a survival material list.
@@ -176,10 +220,7 @@ pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
             ptr_to_idx.insert(b as *const _, i as u32);
         }
 
-        let palette_ids: Vec<String> = palette
-            .iter()
-            .map(|b| b.name.clone().into_owned())
-            .collect();
+        let palette_states: Vec<String> = palette.iter().map(state_key).collect();
 
         // Count materials per palette entry and build the RLE in one pass.
         let mut entry_counts = vec![0u64; palette.len()];
@@ -207,7 +248,9 @@ pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
             if count == 0 {
                 continue;
             }
-            let block_id = &palette_ids[idx];
+            // Material statistics work on bare names; the preview palette
+            // carries full state strings, so strip the property section first.
+            let block_id = bare_block_name(&palette_states[idx]);
             if is_excluded_block(block_id) {
                 continue;
             }
@@ -229,7 +272,7 @@ pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
                 region.size.y as i64,
                 region.size.z as i64,
             ],
-            palette: palette_ids,
+            palette: palette_states,
             rle,
         });
     }
@@ -258,6 +301,7 @@ pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
         total_blocks,
         materials,
         preview: PreviewData {
+            schema: PREVIEW_SCHEMA_VERSION,
             size: [enclosing.x as i64, enclosing.y as i64, enclosing.z as i64],
             regions: regions_out,
         },
@@ -291,5 +335,45 @@ mod tests {
         );
         assert_eq!(block_to_item("minecraft:stone").unwrap(), "minecraft:stone");
         assert!(block_to_item("minecraft:water").is_none());
+    }
+
+    fn state(name: &str, props: &[(&str, &str)]) -> GenericBlockState {
+        GenericBlockState {
+            name: name.to_string().into(),
+            properties: props
+                .iter()
+                .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn state_key_is_canonical_regardless_of_map_order() {
+        // Insertion order is deliberately non-alphabetic; output must be sorted by key.
+        let wire = state(
+            "minecraft:redstone_wire",
+            &[
+                ("power", "7"),
+                ("west", "side"),
+                ("north", "up"),
+                ("south", "side"),
+                ("east", "side"),
+            ],
+        );
+        assert_eq!(
+            state_key(&wire),
+            "minecraft:redstone_wire[east=side,north=up,power=7,south=side,west=side]"
+        );
+        // Property-less blocks stay bare.
+        assert_eq!(state_key(&state("minecraft:stone", &[])), "minecraft:stone");
+    }
+
+    #[test]
+    fn bare_name_strips_property_section() {
+        assert_eq!(
+            bare_block_name("minecraft:oak_stairs[facing=east,half=top,shape=straight]"),
+            "minecraft:oak_stairs"
+        );
+        assert_eq!(bare_block_name("minecraft:stone"), "minecraft:stone");
     }
 }

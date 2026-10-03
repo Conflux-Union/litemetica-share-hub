@@ -51,6 +51,22 @@ impl Storage {
         std::fs::read(self.schematic_path(id))
     }
 
+    /// List the ids of all stored schematics, sorted for deterministic
+    /// iteration. Non-`.litematic` files in the directory are ignored.
+    pub fn schematic_ids(&self) -> std::io::Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(self.root.join("schematics"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "litematic") {
+                if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     pub fn delete_all(&self, id: &str) {
         let _ = std::fs::remove_file(self.schematic_path(id));
         let _ = std::fs::remove_file(self.preview_path(id));
