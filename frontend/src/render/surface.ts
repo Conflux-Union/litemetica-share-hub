@@ -241,10 +241,22 @@ export function extractSurface(grid: VoxelGrid, resolveUv: UvResolver): MeshData
 
             if (uv) {
               const [u0, v0, u1, v1] = uv
-              // Map corners to tile uv; keep texture upright on side faces.
-              const u = cx === 1 ? u1 : u0
-              const vv = cy === 1 ? v1 : v0
-              target.uvs.push(u, vv)
+              // Map each face's two in-plane axes to tile uv; v follows world
+              // up on side faces so textures stay upright. (±Y faces lie in
+              // the x/z plane, ±X faces in the z/y plane, ±Z faces in x/y.)
+              let u: number
+              let v: number
+              if (face.n[1] !== 0) {
+                u = cx === 1 ? u1 : u0
+                v = cz === 1 ? v1 : v0
+              } else if (face.n[0] !== 0) {
+                u = cz === 1 ? u1 : u0
+                v = cy === 1 ? v1 : v0
+              } else {
+                u = cx === 1 ? u1 : u0
+                v = cy === 1 ? v1 : v0
+              }
+              target.uvs.push(u, v)
             } else {
               target.uvs.push(0, 0)
             }

@@ -43,8 +43,17 @@ export function decodePreviewData(preview: PreviewData): VoxelGrid {
   for (const region of preview.regions) {
     // Intern this region's palette first so RLE expansion stays tight.
     const localToGlobal = region.palette.map(intern)
-    const [rx, ry, rz] = region.size
-    const [ox, oy, oz] = region.pos
+    const [sx, sy, sz] = region.size
+    const [px, py, pz] = region.pos
+    // A litematica sub-region spans [pos, pos + size); a negative size means
+    // the region extends below pos, so its min corner is pos + size + 1.
+    // Local coordinates (and the RLE order) always run 0..|size| per axis.
+    const ax = Math.abs(sx)
+    const ay = Math.abs(sy)
+    const az = Math.abs(sz)
+    const ox = px + Math.min(0, sx + 1)
+    const oy = py + Math.min(0, sy + 1)
+    const oz = pz + Math.min(0, sz + 1)
     let cursor = 0
     let x = 0
     let z = 0
@@ -59,9 +68,9 @@ export function decodePreviewData(preview: PreviewData): VoxelGrid {
           data[gy * dz * dx + gz * dx + gx] = global
         }
         // Advance in x -> z -> y order.
-        if (++x === rx) {
+        if (++x === ax) {
           x = 0
-          if (++z === rz) {
+          if (++z === az) {
             z = 0
             y++
           }
@@ -69,7 +78,7 @@ export function decodePreviewData(preview: PreviewData): VoxelGrid {
       }
       cursor += run
     }
-    const expected = rx * ry * rz
+    const expected = ax * ay * az
     if (cursor !== expected) {
       throw new Error(`region "${region.name}" RLE length ${cursor} != volume ${expected}`)
     }
