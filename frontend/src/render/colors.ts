@@ -1,7 +1,36 @@
 /**
- * Fallback block base colors for when no texture atlas has been extracted.
+ * Fallback block base colors for when no render bundle is available.
  * Approximate average colors of the vanilla textures.
  */
+
+/** Strip a state string's "[k=v,...]" section; palettes may carry full
+ * state strings, and every property variant of one block shares its color. */
+function bareName(idOrState: string): string {
+  const open = idOrState.indexOf('[')
+  return open === -1 ? idOrState : idOrState.slice(0, open)
+}
+
+export function blockColor(blockId: string): [number, number, number] {
+  const id = bareName(blockId)
+  const known = BLOCK_COLORS[id]
+  if (known !== undefined) {
+    return [(known >> 16) / 255, ((known >> 8) & 0xff) / 255, (known & 0xff) / 255]
+  }
+  // Deterministic hash color for unknown blocks.
+  let h = 2166136261
+  for (const c of id) {
+    h ^= c.charCodeAt(0)
+    h = Math.imul(h, 16777619)
+  }
+  return [(h & 0xff) / 255, ((h >> 8) & 0xff) / 255, ((h >> 16) & 0xff) / 255]
+}
+
+export function blockColorHex(blockId: string): string {
+  const [r, g, b] = blockColor(blockId)
+  const to2 = (v: number) => Math.round(v * 255).toString(16).padStart(2, '0')
+  return `#${to2(r)}${to2(g)}${to2(b)}`
+}
+
 const BLOCK_COLORS: Record<string, number> = {
   'minecraft:stone': 0x7d7d7d,
   'minecraft:granite': 0x9a6a5a,
@@ -134,24 +163,4 @@ const BLOCK_COLORS: Record<string, number> = {
   'minecraft:white_terracotta': 0xd1b1a1,
   'minecraft:orange_terracotta': 0xa75326,
   'minecraft:light_gray_terracotta': 0x93614b,
-}
-
-export function blockColor(blockId: string): [number, number, number] {
-  const known = BLOCK_COLORS[blockId]
-  if (known !== undefined) {
-    return [(known >> 16) / 255, ((known >> 8) & 0xff) / 255, (known & 0xff) / 255]
-  }
-  // Deterministic hash color for unknown blocks.
-  let h = 2166136261
-  for (const c of blockId) {
-    h ^= c.charCodeAt(0)
-    h = Math.imul(h, 16777619)
-  }
-  return [(h & 0xff) / 255, ((h >> 8) & 0xff) / 255, ((h >> 16) & 0xff) / 255]
-}
-
-export function blockColorHex(blockId: string): string {
-  const [r, g, b] = blockColor(blockId)
-  const to2 = (v: number) => Math.round(v * 255).toString(16).padStart(2, '0')
-  return `#${to2(r)}${to2(g)}${to2(b)}`
 }

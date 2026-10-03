@@ -6,7 +6,12 @@ export const EMPTY = 0
 export interface VoxelGrid {
   /** Dimensions as [x, y, z]. */
   dims: [number, number, number]
-  /** Global block-id palette; index 0 is reserved for air/empty. */
+  /** Global palette of block-state strings; index 0 is reserved for
+   * air/empty. Schema 2 previews carry canonical state strings
+   * ("minecraft:redstone_wire[east=none,power=7,...]"); schema 1 previews
+   * carry bare block ids, which are exactly the property-less spelling of
+   * the same format — both flow through unchanged, and the resolver's
+   * first-variant fallback renders bare ids as their default shape. */
   palette: string[]
   /** Palette index per voxel (y * dz * dx + z * dx + x), EMPTY for air. */
   data: Uint16Array

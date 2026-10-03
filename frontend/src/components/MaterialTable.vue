@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import type { MaterialEntry } from '../types'
-import { loadAtlas } from '../render/atlas'
+import { loadAssets, stateTexture } from '../render/assets'
 import { blockColorHex } from '../render/colors'
 
 const props = defineProps<{ materials: MaterialEntry[] }>()
@@ -26,13 +26,15 @@ const rows = computed(() => {
 
 const total = computed(() => props.materials.reduce((s, m) => s + m.count, 0))
 
-// Block icons: 16x16 crops from the extracted atlas, or flat colors as fallback.
+// Block icons: 16x16 crops of the block's side-model atlas tile, or flat
+// colors as fallback.
 const iconUrls = ref(new Map<string, string>())
 
 onMounted(async () => {
-  const atlas = await loadAtlas()
-  if (!atlas) return
-  const img = atlas.texture.image as HTMLImageElement
+  const store = await loadAssets()
+  if (!store) return
+  const img = store.texture.image as HTMLImageElement
+  const tile = store.bundle.tile
   const canvas = document.createElement('canvas')
   canvas.width = 16
   canvas.height = 16
@@ -40,11 +42,13 @@ onMounted(async () => {
   ctx.imageSmoothingEnabled = false
   const out = new Map<string, string>()
   for (const m of props.materials) {
-    const entry = atlas.manifest.blocks[m.item_id]
+    const texId = stateTexture(store, m.item_id, 'side')
+    if (!texId) continue
+    const entry = store.bundle.textures[texId]
     if (!entry) continue
-    const [col, row] = entry.uv[1] // side face as the icon
+    const [col, row] = entry.uv
     ctx.clearRect(0, 0, 16, 16)
-    ctx.drawImage(img, col * 16, row * 16, 16, 16, 0, 0, 16, 16)
+    ctx.drawImage(img, col * tile, row * tile, tile, tile, 0, 0, 16, 16)
     out.set(m.item_id, canvas.toDataURL())
   }
   iconUrls.value = out

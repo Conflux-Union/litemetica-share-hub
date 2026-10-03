@@ -3,10 +3,9 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { api, ApiError } from '../api'
-import { loadAtlas } from '../render/atlas'
-import { blockColor } from '../render/colors'
+import { loadAssets } from '../render/assets'
 import { decodePreview } from '../render/decode'
-import { extractSurface } from '../render/surface'
+import { extractSurface, type MeshData } from '../render/surface'
 
 const props = defineProps<{ schematicId: string }>()
 
@@ -15,6 +14,19 @@ const status = ref('加载中…')
 const faceCount = ref(0)
 
 let dispose: (() => void) | null = null
+
+/** Geometry for one draw range, sharing the merged attribute arrays. */
+function rangeGeometry(mesh: MeshData, range: { start: number; count: number }): THREE.BufferGeometry {
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3))
+  geometry.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3))
+  geometry.setAttribute('uv', new THREE.BufferAttribute(mesh.uvs, 2))
+  geometry.setAttribute('color', new THREE.BufferAttribute(mesh.colors, 3))
+  geometry.setIndex(
+    new THREE.BufferAttribute(mesh.indices.subarray(range.start, range.start + range.count), 1),
+  )
+  return geometry
+}
 
 async function render() {
   if (!container.value) return
@@ -30,12 +42,12 @@ async function render() {
   const gz = new Uint8Array(await resp.arrayBuffer())
   const grid = decodePreview(gz)
 
-  // 2. Resolve textures: extracted atlas first, flat colors as fallback.
-  const atlas = await loadAtlas()
-  const resolveUv = atlas ? atlas.resolveUv : () => null
+  // 2. Resolve the render bundle (null keeps the flat-color fallback).
+  const store = await loadAssets()
 
-  // 3. Extract visible surfaces (hidden faces culled, AO baked into colors).
-  const mesh = extractSurface(grid, resolveUv)
+  // 3. Mesh: vanilla model quads with cull groups, AO and tint baked into
+  //    vertex colors; opaque / cutout / translucent / flat draw ranges.
+  const mesh = extractSurface(grid, store)
   faceCount.value = mesh.faceCount
 
   // 4. Build the three.js scene.
@@ -52,70 +64,44 @@ async function render() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   container.value.appendChild(renderer.domElement)
 
-  const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3))
-  geometry.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3))
-  geometry.setAttribute('uv', new THREE.BufferAttribute(mesh.uvs, 2))
-  geometry.setAttribute('color', new THREE.BufferAttribute(mesh.colors, 3))
-  geometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1))
-
-  if (atlas) {
-    const mat = new THREE.MeshLambertMaterial({ map: atlas.texture, vertexColors: true })
-    const matT = new THREE.MeshLambertMaterial({
-      map: atlas.texture,
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.65,
-      side: THREE.DoubleSide,
-    })
-    // Opaque faces only; transparent faces render from a separate geometry.
-    const opaque = new THREE.Mesh(geometry, mat)
-    opaque.geometry.setDrawRange(0, mesh.opaqueIndexCount)
-    scene.add(opaque)
-    const alpha = new THREE.BufferGeometry()
-    alpha.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3))
-    alpha.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3))
-    alpha.setAttribute('uv', new THREE.BufferAttribute(mesh.uvs, 2))
-    alpha.setAttribute('color', new THREE.BufferAttribute(mesh.colors, 3))
-    alpha.setIndex(
-      new THREE.BufferAttribute(mesh.indices.subarray(mesh.opaqueIndexCount), 1),
-    )
-    scene.add(new THREE.Mesh(alpha, matT))
-  } else {
-    // Flat-color fallback: bake block color into vertex colors.
-    const colors = new Float32Array(mesh.colors.length)
-    const [dx, , dz] = grid.dims
-    const voxColors = grid.palette.map((id) => blockColor(id))
-    for (let i = 0; i < mesh.positions.length / 3; i++) {
-      // Recover the voxel for this vertex to pick its color.
-      const x = Math.floor(mesh.positions[i * 3])
-      const y = Math.floor(mesh.positions[i * 3 + 1])
-      const z = Math.floor(mesh.positions[i * 3 + 2])
-      const ci = y * dz * dx + z * dx + x
-      const idx = ci >= 0 && ci < grid.data.length ? grid.data[ci] : 0
-      const c = voxColors[idx] ?? [1, 1, 1]
-      const light = mesh.colors[i * 3]
-      colors[i * 3] = c[0] * light
-      colors[i * 3 + 1] = c[1] * light
-      colors[i * 3 + 2] = c[2] * light
+  const materials: THREE.Material[] = []
+  const addMesh = (range: { start: number; count: number }, material: THREE.Material) => {
+    if (!range.count) {
+      material.dispose()
+      return
     }
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true })
-    const matT = new THREE.MeshLambertMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.7,
-      side: THREE.DoubleSide,
-    })
-    const opaqueMesh = new THREE.Mesh(geometry, mat)
-    opaqueMesh.geometry.setDrawRange(0, mesh.opaqueIndexCount)
-    scene.add(opaqueMesh)
-    const alpha = new THREE.BufferGeometry()
-    alpha.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3))
-    alpha.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3))
-    alpha.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    alpha.setIndex(new THREE.BufferAttribute(mesh.indices.subarray(mesh.opaqueIndexCount), 1))
-    scene.add(new THREE.Mesh(alpha, matT))
+    materials.push(material)
+    scene.add(new THREE.Mesh(rangeGeometry(mesh, range), material))
+  }
+
+  if (store) {
+    // Three render passes by alpha class, plus the untextured placeholder
+    // pass. Cutout stays z-buffered via alphaTest; translucents blend last.
+    addMesh(
+      mesh.ranges.opaque,
+      new THREE.MeshLambertMaterial({ map: store.texture, vertexColors: true }),
+    )
+    addMesh(
+      mesh.ranges.cutout,
+      new THREE.MeshLambertMaterial({ map: store.texture, vertexColors: true, alphaTest: 0.5 }),
+    )
+    addMesh(
+      mesh.ranges.translucent,
+      new THREE.MeshLambertMaterial({
+        map: store.texture,
+        vertexColors: true,
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
+    )
+    addMesh(mesh.ranges.flat, new THREE.MeshLambertMaterial({ vertexColors: true }))
+  } else {
+    // Flat-color fallback: block colors are already baked into vertices.
+    addMesh(
+      mesh.ranges.flat,
+      new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+    )
   }
 
   const hemi = new THREE.HemisphereLight(0xffffff, 0x888877, 1.15)
@@ -172,13 +158,13 @@ async function render() {
     ro.disconnect()
     themeObserver.disconnect()
     controls.dispose()
-    geometry.dispose()
-    renderer.dispose()
-    renderer.domElement.remove()
+    for (const material of materials) material.dispose()
     scene.traverse((o) => {
       const m = o as THREE.Mesh
       m.geometry?.dispose?.()
     })
+    renderer.dispose()
+    renderer.domElement.remove()
   }
 }
 
