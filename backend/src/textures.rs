@@ -185,6 +185,14 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
     }
     println!("collected {} models", raw_models.len());
 
+    // 2.5. Chests are entity-rendered in vanilla (their blockstates point at
+    // element-less models), which would leave placeholder cubes. Synthesize
+    // real block models from the entity textures, with facing/type variants,
+    // and crop the 64x64 entity layouts into per-face atlas tiles.
+    let mut derived_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
+    let chest_families = synthesize_chests(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    println!("synthesized chest models for {chest_families} families ({} derived tiles)", derived_tiles.len());
+
     // 3. Keep only models reachable from any blockstate via parent chains.
     let seeds: Vec<String> = block_states
         .values()
@@ -242,6 +250,14 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
         tiles.len(),
         missing
     );
+
+    // 5.5. Derived chest tiles are not jar files; they enter the atlas the
+    // same way, classified from their own pixels (regions padded with
+    // transparency classify as cutout, which is correct for chests).
+    for (id, tile) in &derived_tiles {
+        alpha_classes.insert(id.clone(), alpha_class_of(tile.pixels().map(|p| p.0[3])));
+        tiles.insert(id.clone(), tile.clone());
+    }
 
     // 6. Lay tiles out in a square grid atlas.
     let ordered: Vec<&String> = {
@@ -312,6 +328,232 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
         json_bytes.len()
     );
     Ok(())
+}
+
+// ---- Chest model synthesis -------------------------------------------------
+//
+// Vanilla renders chests as block entities: their blockstates point at
+// element-less models, so a model-based renderer shows placeholder cubes
+// (Shulkr's packager solves this the same way — synthesized chest models).
+// We build real block models from the 64x64 entity textures, whose box
+// layouts are stable across versions and were verified against the actual
+// jar textures (lid 14x5x14 @ texOffs(0,0), base 14x10x14 @ (0,19), latch
+// 2x4x1 @ (0,0); double-chest halves are 15 wide).
+
+/// Entity-texture stem (under assets/minecraft/textures/entity/chest/) for
+/// each chest-family blockstate. Waxed variants share the plain textures;
+/// trapped chests look identical to normal ones.
+fn chest_texture_stem(block_id: &str) -> Option<&'static str> {
+    let name = block_id.strip_prefix("minecraft:block/")?;
+    Some(match name {
+        "chest" | "trapped_chest" => "normal",
+        "ender_chest" => "ender",
+        "copper_chest" | "waxed_copper_chest" => "copper",
+        "exposed_copper_chest" | "waxed_exposed_copper_chest" => "copper_exposed",
+        "weathered_copper_chest" | "waxed_weathered_copper_chest" => "copper_weathered",
+        "oxidized_copper_chest" | "waxed_oxidized_copper_chest" => "copper_oxidized",
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// The six face rects of a vanilla entity box (w x h x d) at texOffs(u, v)
+/// in the standard entity-atlas layout: up/down in the first row, then
+/// [lateral, front, lateral, back] in the second.
+fn box_face_rects(w: u32, h: u32, d: u32, u: u32, v: u32) -> [Rect; 6] {
+    [
+        Rect { x: u + d, y: v, w, h: d },
+        Rect { x: u + d + w, y: v, w, h: d },
+        Rect { x: u + d, y: v + d, w, h },
+        Rect { x: u + 2 * d + w, y: v + d, w, h },
+        Rect { x: u, y: v + d, w: d, h },
+        Rect { x: u + d + w, y: v + d, w: d, h },
+    ]
+}
+
+/// Crop one face region into its own transparent-padded 16x16 atlas tile.
+fn crop_tile(src: &image::RgbaImage, r: Rect) -> image::RgbaImage {
+    let mut tile = image::RgbaImage::new(TILE, TILE);
+    let region = image::imageops::crop_imm(src, r.x, r.y, r.w, r.h).to_image();
+    image::imageops::overlay(&mut tile, &region, 0, 0);
+    tile
+}
+
+const CHEST_EPS: f64 = 0.002;
+
+/// One chest body part (base or lid) as a model element. Each face samples
+/// its own derived tile, so the uv is simply the region size. `prefix` names
+/// the part (e.g. "base"); `w`/`h`/`d` are the entity box dims at texOffs
+/// (u, v). Lateral (west/east) faces use the depth-sized rects.
+fn chest_part_element(
+    src: &image::RgbaImage,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+    tile_prefix: &str,
+    part: &str,
+    from: [f64; 3],
+    to: [f64; 3],
+    w: u32,
+    h: u32,
+    d: u32,
+    u: u32,
+    v: u32,
+) -> (Value, Map<String, Value>) {
+    let rects = box_face_rects(w, h, d, u, v);
+    let dirs = ["up", "down", "north", "south", "west", "east"];
+    let mut faces = Map::new();
+    let mut textures = Map::new();
+    for (i, dir) in dirs.iter().enumerate() {
+        let r = rects[i];
+        let key = format!("{part}_{dir}");
+        let tile_id = format!("{tile_prefix}__{key}");
+        derived_tiles.entry(tile_id.clone()).or_insert_with(|| crop_tile(src, r));
+        textures.insert(key.clone(), json!(tile_id));
+        faces.insert(
+            dir.to_string(),
+            json!({ "texture": format!("#{key}"), "uv": [0, 0, r.w, r.h] }),
+        );
+    }
+    (json!({ "from": from, "to": to, "faces": faces }), textures)
+}
+
+/// A full chest model for one texture stem. `x0`/`x1` place the base box in
+/// the block (14 wide for singles, 15 wide flush to one side for halves);
+/// `halves` selects the double-chest box dims and omits the latch.
+fn chest_model_json(
+    src: &image::RgbaImage,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+    tile_prefix: &str,
+    x0: f64,
+    x1: f64,
+    half: bool,
+) -> Value {
+    let (bw, latch) = if half { (15u32, false) } else { (14u32, true) };
+    let (base, base_tex) = chest_part_element(
+        src, derived_tiles, tile_prefix, "base",
+        [x0, 0.0, 1.0], [x1, 10.0, 15.0],
+        bw, 10, 14, 0, 19,
+    );
+    let (lid, lid_tex) = chest_part_element(
+        src, derived_tiles, tile_prefix, "lid",
+        [x0 + CHEST_EPS, 9.0, 1.0 + CHEST_EPS], [x1 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS],
+        bw, 5, 14, 0, 0,
+    );
+    let mut elements = vec![base, lid];
+    let mut textures = base_tex;
+    for (k, v) in lid_tex {
+        textures.insert(k, v);
+    }
+    if latch {
+        // The latch samples sub-rects of one 6x5 tile cropped from the
+        // texture's top-left corner (the region vanilla's lock box uses).
+        let latch_tile = format!("{tile_prefix}__latch");
+        derived_tiles
+            .entry(latch_tile.clone())
+            .or_insert_with(|| crop_tile(src, Rect { x: 0, y: 0, w: 6, h: 5 }));
+        textures.insert("latch".into(), json!(latch_tile));
+        let rects = box_face_rects(2, 4, 1, 0, 0);
+        let dirs = ["up", "down", "north", "south", "west", "east"];
+        let mut faces = Map::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let r = rects[i];
+            faces.insert(
+                dir.to_string(),
+                json!({
+                    "texture": "#latch",
+                    "uv": [r.x, r.y, r.x + r.w, r.y + r.h],
+                }),
+            );
+        }
+        elements.push(json!({
+            "from": [7.0, 7.0, 0.0],
+            "to": [9.0, 11.0, 1.0],
+            "faces": faces,
+        }));
+    }
+    textures.insert("particle".into(), json!("#base_up"));
+    json!({ "textures": textures, "elements": elements })
+}
+
+/// Replace every chest-family blockstate with facing/type variants that map
+/// to the synthesized models, registering the models in `raw_models` (the
+/// parent-closure pass picks them up from there). Returns the number of
+/// chest families synthesized.
+fn synthesize_chests(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let families: Vec<(String, &'static str)> = block_states
+        .keys()
+        .filter_map(|k| chest_texture_stem(k).map(|stem| (k.clone(), stem)))
+        .collect();
+    let mut count = 0;
+    for (state_key, stem) in families {
+        let block_name = state_key.trim_start_matches("minecraft:block/").to_string();
+        let mut load = |stem: &str| -> Option<image::RgbaImage> {
+            let zip_name = format!("assets/minecraft/textures/entity/chest/{stem}.png");
+            let bytes = read_zip_file(archive, &zip_name)?;
+            image::load_from_memory(&bytes).ok().map(|img| img.to_rgba8())
+        };
+        let Some(single_src) = load(stem) else {
+            eprintln!("[chest] {stem}.png missing from jar; {state_key} keeps placeholder");
+            continue;
+        };
+        let tile_prefix = format!("minecraft:entity/chest/{stem}");
+        let single_model = format!("minecraft:block/{block_name}_single");
+        raw_models.insert(
+            single_model.clone(),
+            chest_model_json(&single_src, derived_tiles, &tile_prefix, 1.0, 15.0, false),
+        );
+
+        // Variant table: "" covers property-less (schema-1) states; the
+        // facing/type keys win by best-partial match. Variant y=90 maps the
+        // model's north-facing front to east (the renderer's convention).
+        // Double-chest halves are flush against the block-boundary seam
+        // (left half hugs the east edge of its block, right half the west
+        // edge) so an adjacent left+right pair reads as one continuous box.
+        let mut variants = Map::new();
+        variants.insert("".into(), json!({ "model": single_model }));
+        let halves = [
+            ("left", (stem.to_string() + "_left", 1.0)),
+            ("right", (stem.to_string() + "_right", 0.0)),
+        ]
+        .into_iter()
+        .filter_map(|(ty, (tex_stem, x0))| {
+            let src = load(&tex_stem)?;
+            let model_id = format!("minecraft:block/{block_name}_{ty}");
+            let prefix = format!("minecraft:entity/chest/{tex_stem}");
+            raw_models.insert(
+                model_id.clone(),
+                chest_model_json(&src, derived_tiles, &prefix, x0, x0 + 15.0, true),
+            );
+            Some((ty, model_id))
+        })
+        .collect::<Vec<_>>();
+        for (facing, y) in [("north", 0), ("east", 90), ("south", 180), ("west", 270)] {
+            variants.insert(
+                format!("facing={facing},type=single"),
+                json!({ "model": single_model, "y": y }),
+            );
+            for (ty, model_id) in &halves {
+                variants.insert(
+                    format!("facing={facing},type={ty}"),
+                    json!({ "model": model_id, "y": y }),
+                );
+            }
+        }
+        block_states.insert(state_key, json!({ "variants": variants }));
+        count += 1;
+    }
+    count
 }
 
 /// All model ids a blockstate JSON references: every variant value (object or
@@ -699,6 +941,85 @@ mod tests {
         );
         assert_eq!(colormap_name("minecraft:colormap/grass"), Some("grass"));
         assert_eq!(colormap_name("minecraft:block/stone"), None);
+    }
+
+    #[test]
+    fn chest_box_layout_matches_vanilla_textures() {
+        // Single-chest base (14x10x14 @ texOffs(0,19)) and lid (14x5x14 @
+        // (0,0)): rects verified against the actual entity texture regions.
+        let base = box_face_rects(14, 10, 14, 0, 19);
+        let assert_rect = |r: &Rect, x: u32, y: u32, w: u32, h: u32| {
+            assert_eq!((r.x, r.y, r.w, r.h), (x, y, w, h));
+        };
+        assert_rect(&base[0], 14, 19, 14, 14); // up
+        assert_rect(&base[1], 28, 19, 14, 14); // down
+        assert_rect(&base[2], 14, 33, 14, 10); // north
+        assert_rect(&base[3], 42, 33, 14, 10); // south
+        assert_rect(&base[4], 0, 33, 14, 10);  // west lateral
+        assert_rect(&base[5], 28, 33, 14, 10); // east lateral
+        let lid = box_face_rects(14, 5, 14, 0, 0);
+        assert_rect(&lid[0], 14, 0, 14, 14);
+        assert_rect(&lid[2], 14, 14, 14, 5);
+        // Latch (2x4x1 @ (0,0)) fits the 6x5 top-left texture corner.
+        let latch = box_face_rects(2, 4, 1, 0, 0);
+        assert_rect(&latch[0], 1, 0, 2, 1);
+        assert_rect(&latch[2], 1, 1, 2, 4);
+        assert_rect(&latch[3], 4, 1, 2, 4);
+        // Double-chest halves are 15 wide.
+        let half = box_face_rects(15, 10, 14, 0, 19);
+        assert_rect(&half[0], 14, 19, 15, 14);
+        assert_rect(&half[3], 43, 33, 15, 10);
+        assert_rect(&half[5], 29, 33, 14, 10);
+    }
+
+    #[test]
+    fn synthesized_chest_model_shape() {
+        // A distinct color per texture pixel lets us verify each face tile
+        // sampled the right region of the synthetic 64x64 source.
+        let src = image::RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba([(x * 4) as u8, (y * 4) as u8, 128, 255])
+        });
+        let mut tiles: HashMap<String, image::RgbaImage> = HashMap::new();
+        let model = chest_model_json(&src, &mut tiles, "minecraft:entity/chest/test", 1.0, 15.0, false);
+
+        let elements = model["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3, "base + lid + latch");
+        // Base sits inside the block; lid is inset to avoid coplanar sides.
+        assert_eq!(elements[0]["from"], json!([1.0, 0.0, 1.0]));
+        assert_eq!(elements[0]["to"], json!([15.0, 10.0, 15.0]));
+        assert_eq!(elements[1]["to"], json!([15.0 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS]));
+        let latch = &elements[2];
+        assert_eq!(latch["from"], json!([7.0, 7.0, 0.0]));
+        assert_eq!(latch["to"], json!([9.0, 11.0, 1.0]));
+        assert_eq!(latch["faces"]["north"]["uv"], json!([1, 1, 3, 5]));
+
+        // Every face tile cropped its region: the base-up tile's first pixel
+        // equals the source pixel at the region origin (14, 19).
+        let up = &tiles["minecraft:entity/chest/test__base_up"];
+        assert_eq!(up.get_pixel(0, 0), src.get_pixel(14, 19));
+        let north = &tiles["minecraft:entity/chest/test__base_north"];
+        assert_eq!(north.get_pixel(0, 0), src.get_pixel(14, 33));
+        // The half variant has no latch and is 15 wide.
+        let mut half_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
+        let half = chest_model_json(&src, &mut half_tiles, "minecraft:entity/chest/test_h", 0.0, 15.0, true);
+        assert_eq!(half["elements"].as_array().unwrap().len(), 2);
+        assert_eq!(half["elements"][0]["from"], json!([0.0, 0.0, 1.0]));
+        assert!(half["textures"].get("latch").is_none());
+    }
+
+    #[test]
+    fn chest_families_map_to_entity_textures() {
+        assert_eq!(chest_texture_stem("minecraft:block/chest"), Some("normal"));
+        assert_eq!(
+            chest_texture_stem("minecraft:block/trapped_chest"),
+            Some("normal")
+        );
+        assert_eq!(chest_texture_stem("minecraft:block/ender_chest"), Some("ender"));
+        assert_eq!(
+            chest_texture_stem("minecraft:block/waxed_exposed_copper_chest"),
+            Some("copper_exposed")
+        );
+        assert_eq!(chest_texture_stem("minecraft:block:oak_planks"), None);
     }
 
     #[test]

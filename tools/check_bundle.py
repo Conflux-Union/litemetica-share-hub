@@ -59,6 +59,39 @@ def check_bundle_shape(bundle: dict, data_dir: str, errors: list[str]) -> None:
     if "parent" not in block_models.get("minecraft:block/cube", {}):
         errors.append("minecraft:block/cube lost its parent field (verbatim JSON broken)")
 
+    # Chests are entity-rendered in vanilla; the extractor must synthesize
+    # block models + facing/type variants so chests are not placeholder cubes.
+    chest_state = block_states.get("minecraft:block/chest")
+    if not isinstance(chest_state, dict):
+        errors.append("blockStates is missing minecraft:block/chest")
+    else:
+        variants = chest_state.get("variants")
+        if not isinstance(variants, dict) or not variants:
+            errors.append("minecraft:block/chest has no synthesized variants")
+        else:
+            if "" not in variants:
+                errors.append("minecraft:block/chest lacks the property-less default variant")
+            east_single = variants.get("facing=east,type=single")
+            if not (isinstance(east_single, dict) and east_single.get("y") == 90):
+                errors.append(
+                    f"facing=east,type=single should rotate y=90, got {east_single!r}"
+                )
+            referenced = {
+                v.get("model")
+                for v in variants.values()
+                if isinstance(v, dict)
+            }
+            missing_models = [m for m in referenced if m not in block_models]
+            if missing_models:
+                errors.append(f"chest variants reference missing models: {missing_models}")
+    for chest_model in ("minecraft:block/chest_single", "minecraft:block/ender_chest_single"):
+        model = block_models.get(chest_model)
+        if not isinstance(model, dict) or not isinstance(model.get("elements"), list) or len(model["elements"]) < 2:
+            errors.append(f"{chest_model} is missing synthesized elements")
+    if "minecraft:entity/chest/normal__base_up" not in bundle.get("textures", {}):
+        errors.append("textures is missing derived chest tile normal__base_up")
+
+
     textures = bundle.get("textures")
     if not isinstance(textures, dict):
         errors.append("bundle.textures is missing or not an object")
