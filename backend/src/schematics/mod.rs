@@ -270,10 +270,7 @@ pub async fn upload(
 
     let id = storage::new_schematic_id();
     state.storage.store_schematic(&id, &bytes)?;
-    state.storage.store_preview(
-        &id,
-        &serde_json::to_value(&parsed.preview).map_err(|e| AppError::Internal(e.to_string()))?,
-    )?;
+    state.storage.store_preview(&id, &parsed.preview)?;
 
     let description = description_override.unwrap_or(parsed.description.clone());
     let materials_json =
@@ -429,10 +426,8 @@ fn regen_preview(
         .read_schematic(id)
         .map_err(|e| format!("cannot read schematic: {e}"))?;
     let parsed = parse::parse_litematic(&bytes, decompress_limit)?;
-    let value = serde_json::to_value(&parsed.preview)
-        .map_err(|e| format!("cannot serialize preview: {e}"))?;
     storage
-        .store_preview(id, &value)
+        .store_preview(id, &parsed.preview)
         .map_err(|e| format!("cannot write preview: {e}"))
 }
 
@@ -443,6 +438,55 @@ mod regen_tests {
     use mcdata::util::BlockPos;
     use mcdata::{BlockState, GenericBlockState};
     use rustmatica::{Litematic, Region};
+    use std::io::Read;
+
+    /// Minimal cursor over a schema-3 preview payload: unsigned LEB128
+    /// varints, zigzag-decoded signed varints, and length-prefixed strings.
+    struct BinReader<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl BinReader<'_> {
+        fn new(buf: &[u8]) -> BinReader<'_> {
+            BinReader { buf, pos: 0 }
+        }
+
+        fn byte(&mut self) -> u8 {
+            let b = self.buf[self.pos];
+            self.pos += 1;
+            b
+        }
+
+        fn take(&mut self, n: usize) -> &'_ [u8] {
+            let s = &self.buf[self.pos..self.pos + n];
+            self.pos += n;
+            s
+        }
+
+        fn uvarint(&mut self) -> u64 {
+            let mut result = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let b = self.byte();
+                result |= u64::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    return result;
+                }
+                shift += 7;
+            }
+        }
+
+        fn varint(&mut self) -> i64 {
+            let v = self.uvarint();
+            ((v >> 1) as i64) ^ -((v & 1) as i64)
+        }
+
+        fn string(&mut self) -> String {
+            let len = self.uvarint() as usize;
+            String::from_utf8(self.take(len).to_vec()).expect("valid UTF-8")
+        }
+    }
 
     fn temp_storage(tag: &str) -> (Storage, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lsh-regen-{tag}-{}", std::process::id()));
@@ -492,7 +536,7 @@ mod regen_tests {
         storage.store_schematic("bbb", b"x").unwrap();
         storage.store_schematic("aaa", b"x").unwrap();
         std::fs::write(dir.join("schematics/notes.txt"), b"junk").unwrap();
-        std::fs::write(dir.join("schematics/partial.json.gz.tmp"), b"junk").unwrap();
+        std::fs::write(dir.join("schematics/partial.bin.gz.tmp"), b"junk").unwrap();
 
         let ids = storage.schematic_ids().unwrap();
         assert_eq!(ids, vec!["aaa".to_string(), "bbb".to_string()]);
@@ -504,9 +548,11 @@ mod regen_tests {
     fn regen_rewrites_previews_and_continues_past_failures() {
         let (storage, dir) = temp_storage("run");
         let bytes = litematic_bytes();
-        storage.store_schematic("good1", &bytes).unwrap();
+        // A stale schema-2 JSON preview must be cleaned up by the regen pass.
+        std::fs::write(dir.join("previews/legacy.json.gz"), b"stale").unwrap();
+        storage.store_schematic("legacy", &bytes).unwrap();
         storage.store_schematic("bad", b"not a litematic").unwrap();
-        storage.store_schematic("good2", &bytes).unwrap();
+        storage.store_schematic("good", &bytes).unwrap();
 
         let report = regen_previews(
             &storage,
@@ -515,7 +561,7 @@ mod regen_tests {
         .unwrap();
         assert_eq!(
             report.regenerated,
-            vec!["good1".to_string(), "good2".to_string()]
+            vec!["good".to_string(), "legacy".to_string()]
         );
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, "bad");
@@ -525,21 +571,57 @@ mod regen_tests {
             report.failed[0].1
         );
 
-        // Rewritten previews decode to schema 2 and keep the full state string.
-        for id in ["good1", "good2"] {
+        // Rewritten previews decode as schema-3 LPRV payloads and keep the
+        // full state string in the palette.
+        for id in ["good", "legacy"] {
             let raw = storage.read_preview(id).unwrap();
             let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
-            let json: serde_json::Value = serde_json::from_reader(&mut decoder).unwrap();
-            assert_eq!(json["schema"], parse::PREVIEW_SCHEMA_VERSION);
-            let palette = json["regions"][0]["palette"].as_array().unwrap();
-            let states: Vec<&str> = palette.iter().filter_map(|v| v.as_str()).collect();
-            assert!(states.contains(&"minecraft:air"));
-            assert!(states.contains(
+            let mut payload = Vec::new();
+            decoder.read_to_end(&mut payload).unwrap();
+            let mut r = BinReader::new(&payload);
+            assert_eq!(r.take(4), parse::PREVIEW_MAGIC.as_slice());
+            assert_eq!(r.byte() as u32, parse::PREVIEW_SCHEMA_VERSION);
+            let dims: Vec<u64> = (0..3).map(|_| r.uvarint()).collect();
+            assert_eq!(dims, vec![2, 1, 1]);
+            assert_eq!(r.uvarint(), 1, "regionCount");
+            assert_eq!(r.string(), "main");
+            let pos: Vec<i64> = (0..3).map(|_| r.varint()).collect();
+            let size: Vec<i64> = (0..3).map(|_| r.varint()).collect();
+            assert_eq!(pos, vec![0, 0, 0]);
+            assert_eq!(size, vec![2, 1, 1]);
+            let palette_count = r.uvarint() as usize;
+            let palette: Vec<String> = (0..palette_count).map(|_| r.string()).collect();
+            assert!(palette.contains(&"minecraft:air".to_string()));
+            assert!(palette.contains(
                 &"minecraft:redstone_wire[east=side,north=up,power=7,south=side,west=side]"
+                    .to_string()
             ));
+            // Runs resolve to the wire voxel followed by air, covering the
+            // region volume exactly.
+            let run_count = r.uvarint() as usize;
+            let mut expanded: Vec<String> = Vec::new();
+            for _ in 0..run_count {
+                let idx = r.uvarint() as usize;
+                let len = r.uvarint();
+                assert!(idx < palette_count, "palette index in range");
+                for _ in 0..len {
+                    expanded.push(palette[idx].clone());
+                }
+            }
+            assert_eq!(
+                expanded,
+                vec![
+                    "minecraft:redstone_wire[east=side,north=up,power=7,south=side,west=side]"
+                        .to_string(),
+                    "minecraft:air".to_string()
+                ]
+            );
+            assert_eq!(r.pos, payload.len(), "payload fully consumed");
         }
-        // The failing schematic keeps no preview file.
+        // The failing schematic keeps no preview file, and the schema-2 JSON
+        // preview is gone after regen.
         assert!(storage.read_preview("bad").is_err());
+        assert!(!dir.join("previews/legacy.json.gz").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

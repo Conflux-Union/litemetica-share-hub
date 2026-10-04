@@ -161,30 +161,30 @@ def check_bundle_shape(bundle: dict, data_dir: str, errors: list[str]) -> None:
 
 
 def check_previews(data_dir: str, errors: list[str]) -> None:
-    previews = sorted(glob.glob(os.path.join(data_dir, "previews", "*.json.gz")))
-    if not previews:
-        errors.append("no preview payloads under data/previews/*.json.gz")
-        return
+    # Current format: gzip-compressed binary LPRV payloads (schema 3).
+    # Magic + version byte are enough to catch stale or corrupt payloads.
+    previews = sorted(glob.glob(os.path.join(data_dir, "previews", "*.bin.gz")))
     for path in previews:
         try:
-            with gzip.open(path, "rt", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+            with gzip.open(path, "rb") as f:
+                header = f.read(5)
+        except OSError as e:
             errors.append(f"cannot decode preview {path}: {e}")
             continue
-        if payload.get("schema") != 2:
-            continue
-        has_state = any(
-            "[" in entry
-            for region in payload.get("regions", [])
-            for entry in region.get("palette", [])
+        if len(header) < 5 or header[:4] != b"LPRV":
+            errors.append(f"preview {path} does not start with the LPRV magic: {header[:4]!r}")
+        elif header[4] != 3:
+            errors.append(f"preview {path} is LPRV version {header[4]}, expected 3")
+    if not previews:
+        errors.append(
+            "no preview payloads under data/previews/*.bin.gz (run the regen-previews subcommand)"
         )
-        if has_state:
-            return
-    errors.append(
-        "no preview with schema 2 and a property-carrying palette entry "
-        "(run the regen-previews subcommand)"
-    )
+    # Schema-2 JSON payloads are legacy; regen rewrites them as LPRV and
+    # deletes the old file.
+    for path in sorted(glob.glob(os.path.join(data_dir, "previews", "*.json.gz"))):
+        errors.append(
+            f"legacy schema-2 preview {path}; run the regen-previews subcommand to migrate to LPRV v3"
+        )
 
 
 def main() -> int:

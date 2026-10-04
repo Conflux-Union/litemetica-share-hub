@@ -1,3 +1,4 @@
+use super::parse;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,12 @@ impl Storage {
     }
 
     pub fn preview_path(&self, id: &str) -> PathBuf {
+        self.root.join("previews").join(format!("{id}.bin.gz"))
+    }
+
+    /// Preview payload path of the schema-2 JSON format this layout replaces;
+    /// kept only so stale files can be cleaned up.
+    fn legacy_preview_path(&self, id: &str) -> PathBuf {
         self.root.join("previews").join(format!("{id}.json.gz"))
     }
 
@@ -35,12 +42,16 @@ impl Storage {
         atomic_write(self.schematic_path(id), bytes)
     }
 
-    pub fn store_preview(&self, id: &str, value: &serde_json::Value) -> std::io::Result<()> {
-        let json = serde_json::to_vec(value)?;
+    pub fn store_preview(&self, id: &str, preview: &parse::PreviewData) -> std::io::Result<()> {
+        let raw = parse::preview_bytes(preview);
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(&json)?;
+        gz.write_all(&raw)?;
         let compressed = gz.finish()?;
-        atomic_write(self.preview_path(id), &compressed)
+        atomic_write(self.preview_path(id), &compressed)?;
+        // Regenerating over an older deployment must not leave the schema-2
+        // JSON payload behind; a fresh upload simply finds no legacy file.
+        let _ = std::fs::remove_file(self.legacy_preview_path(id));
+        Ok(())
     }
 
     pub fn read_preview(&self, id: &str) -> std::io::Result<Vec<u8>> {
@@ -70,6 +81,7 @@ impl Storage {
     pub fn delete_all(&self, id: &str) {
         let _ = std::fs::remove_file(self.schematic_path(id));
         let _ = std::fs::remove_file(self.preview_path(id));
+        let _ = std::fs::remove_file(self.legacy_preview_path(id));
     }
 }
 

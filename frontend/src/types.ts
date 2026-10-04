@@ -51,24 +51,6 @@ export interface SiteConfig {
   max_upload_mb: number
 }
 
-export interface RegionPreview {
-  name: string
-  pos: [number, number, number]
-  size: [number, number, number]
-  /** Schema 2: canonical full-state strings; schema 1: bare block ids
-   * (valid property-less state strings). */
-  palette: string[]
-  rle: [number, number][]
-}
-
-export interface PreviewData {
-  /** 1 = bare-id palette (legacy), 2 = full-state-string palette. Absent
-   * on stored schema-1 previews, so treat undefined as 1. */
-  schema?: number
-  size: [number, number, number]
-  regions: RegionPreview[]
-}
-
 // ---------------------------------------------------------------------------
 // Render-bundle wire types (GET /api/textures/bundle, gzip JSON; see
 // backend/src/textures.rs build_bundle for the emitter).

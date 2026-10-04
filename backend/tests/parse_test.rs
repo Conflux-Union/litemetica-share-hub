@@ -7,6 +7,96 @@ use mcdata::util::BlockPos;
 use mcdata::{BlockState, GenericBlockState};
 use rustmatica::{Litematic, Region};
 
+/// Minimal cursor over a schema-3 preview payload: unsigned LEB128 varints,
+/// zigzag-decoded signed varints, and length-prefixed strings.
+struct BinReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl BinReader<'_> {
+    fn new(buf: &[u8]) -> BinReader<'_> {
+        BinReader { buf, pos: 0 }
+    }
+
+    fn byte(&mut self) -> u8 {
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        b
+    }
+
+    fn take(&mut self, n: usize) -> &'_ [u8] {
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        s
+    }
+
+    fn uvarint(&mut self) -> u64 {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let b = self.byte();
+            result |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return result;
+            }
+            shift += 7;
+        }
+    }
+
+    fn varint(&mut self) -> i64 {
+        let v = self.uvarint();
+        ((v >> 1) as i64) ^ -((v & 1) as i64)
+    }
+
+    fn string(&mut self) -> String {
+        let len = self.uvarint() as usize;
+        String::from_utf8(self.take(len).to_vec()).expect("valid UTF-8")
+    }
+}
+
+/// One region decoded from the binary payload, mirroring
+/// [`parse::RegionPreview`] field for field.
+struct DecodedRegion {
+    name: String,
+    pos: [i64; 3],
+    size: [i64; 3],
+    palette: Vec<String>,
+    rle: Vec<[u64; 2]>,
+}
+
+fn decode_preview(payload: &[u8]) -> Vec<DecodedRegion> {
+    let mut r = BinReader::new(payload);
+    assert_eq!(r.take(4), parse::PREVIEW_MAGIC.as_slice());
+    assert_eq!(r.byte() as u32, parse::PREVIEW_SCHEMA_VERSION);
+    let dims = [r.uvarint(), r.uvarint(), r.uvarint()];
+    let region_count = r.uvarint() as usize;
+    let mut regions = Vec::with_capacity(region_count);
+    for _ in 0..region_count {
+        let mut region = DecodedRegion {
+            name: r.string(),
+            pos: [r.varint(), r.varint(), r.varint()],
+            size: [r.varint(), r.varint(), r.varint()],
+            palette: Vec::new(),
+            rle: Vec::new(),
+        };
+        let palette_count = r.uvarint() as usize;
+        region.palette = (0..palette_count).map(|_| r.string()).collect();
+        let run_count = r.uvarint() as usize;
+        region.rle = Vec::with_capacity(run_count);
+        for _ in 0..run_count {
+            let idx = r.uvarint();
+            let len = r.uvarint();
+            assert!(idx < palette_count as u64, "palette index in range");
+            region.rle.push([idx, len]);
+        }
+        regions.push(region);
+    }
+    assert!(dims.iter().all(|d| *d > 0), "enclosing dims are positive");
+    assert_eq!(r.pos, payload.len(), "payload fully consumed");
+    regions
+}
+
 fn block(name: &str) -> GenericBlockState {
     GenericBlockState {
         name: name.to_string().into(),
@@ -52,6 +142,12 @@ fn build_test_litematic() -> Litematic {
         }
     }
     schem.regions.push(region);
+    // Second region with a negative size: it extends in the negative x/z
+    // direction from its position, while local coordinates still run over
+    // 0..|size| relative to the minimum corner.
+    let mut annex = Region::new("annex", BlockPos::new(6, 0, 3), BlockPos::new(-2, 2, -3));
+    annex.set_block(BlockPos::new(0, 0, 0), block("minecraft:stone"));
+    schem.regions.push(annex);
     schem
 }
 
@@ -68,10 +164,12 @@ fn parse_pipeline_roundtrip() {
     assert_eq!(parsed.mc_version_name, "1.20.4");
     assert_eq!(parsed.mc_data_version, 3700);
     assert_eq!(parsed.litematica_version, 6);
-    assert_eq!((parsed.width, parsed.height, parsed.depth), (4, 3, 2));
-    assert_eq!(parsed.region_count, 1);
-    // stone x2 + oak_wall_sign + carrots + redstone_wire (water and air excluded)
-    assert_eq!(parsed.total_blocks, 5);
+    // The annex at pos (6,0,3) size (-2,2,-3) extends the enclosing box to
+    // x 0..6, y 0..2, z 0..3.
+    assert_eq!((parsed.width, parsed.height, parsed.depth), (7, 3, 4));
+    assert_eq!(parsed.region_count, 2);
+    // stone x3 + oak_wall_sign + carrots + redstone_wire (water and air excluded)
+    assert_eq!(parsed.total_blocks, 6);
 
     let by_id = |id: &str| {
         parsed
@@ -80,7 +178,7 @@ fn parse_pipeline_roundtrip() {
             .find(|m| m.item_id == id)
             .map(|m| m.count)
     };
-    assert_eq!(by_id("minecraft:stone"), Some(2));
+    assert_eq!(by_id("minecraft:stone"), Some(3));
     assert_eq!(
         by_id("minecraft:oak_sign"),
         Some(1),
@@ -96,19 +194,44 @@ fn parse_pipeline_roundtrip() {
     assert_eq!(by_id("minecraft:redstone"), Some(1));
     assert!(parsed.materials.iter().all(|m| !m.name_zh.is_empty()));
 
-    // RLE roundtrip: expand and compare block-by-block against the source region.
-    let region = &parsed.preview.regions[0];
-    assert_eq!(region.size, [4, 3, 2]);
-    assert_eq!(region.palette.len(), schem.regions[0].block_palette().len());
+    assert_eq!(parsed.preview.regions[0].size, [4, 3, 2]);
+    assert_eq!(
+        parsed.preview.regions[0].palette.len(),
+        schem.regions[0].block_palette().len()
+    );
 
-    let volume = 4 * 3 * 2;
-    let mut expanded = Vec::with_capacity(volume);
-    for [idx, run] in &region.rle {
-        for _ in 0..*run {
-            expanded.push(region.palette[*idx as usize].clone());
-        }
+    // Binary roundtrip: serialize the preview into the schema-3 format and
+    // decode it with the test-side reader. The wire payload must carry every
+    // parsed region field unchanged, including the negative annex size.
+    let payload = parse::preview_bytes(&parsed.preview);
+    let decoded = decode_preview(&payload);
+    assert_eq!(decoded.len(), 2);
+    for (decoded, region) in decoded.iter().zip(&parsed.preview.regions) {
+        assert_eq!(decoded.name, region.name);
+        assert_eq!(decoded.pos, region.pos);
+        assert_eq!(decoded.size, region.size);
+        assert_eq!(decoded.palette, region.palette);
+        assert_eq!(decoded.rle, region.rle);
     }
-    assert_eq!(expanded.len(), volume);
+    assert_eq!(decoded[0].name, "main");
+    assert_eq!(decoded[1].name, "annex");
+    assert_eq!(decoded[1].pos, [6, 0, 3]);
+    assert_eq!(decoded[1].size, [-2, 2, -3]);
+    assert_eq!(decoded[1].palette, vec!["minecraft:air", "minecraft:stone"]);
+
+    // RLE roundtrip off the decoded bytes: expand and compare block-by-block
+    // against the source region.
+    let expand = |region: &DecodedRegion| -> Vec<String> {
+        let mut expanded = Vec::new();
+        for [idx, run] in &region.rle {
+            for _ in 0..*run {
+                expanded.push(region.palette[*idx as usize].clone());
+            }
+        }
+        expanded
+    };
+    let expanded = expand(&decoded[0]);
+    assert_eq!(expanded.len(), 4 * 3 * 2);
 
     // Iteration order is x fastest, then z, then y (litematica storage order).
     let lookup = |x: usize, y: usize, z: usize| -> usize { y * (2 * 4) + z * 4 + x };
@@ -125,9 +248,12 @@ fn parse_pipeline_roundtrip() {
     assert_eq!(expanded[lookup(1, 1, 0)], "minecraft:air");
     assert_eq!(expanded[lookup(3, 2, 1)], "minecraft:air");
 
-    // The preview JSON must be serializable for storage.
-    let json = serde_json::to_value(&parsed.preview).expect("preview serializes");
-    assert!(!json.to_string().is_empty());
+    // The negative-size annex still carries |size| voxels: the stone at local
+    // (0,0,0) followed by |size|-1 air blocks.
+    let annex = expand(&decoded[1]);
+    assert_eq!(annex.len(), 2 * 2 * 3);
+    assert_eq!(annex[0], "minecraft:stone");
+    assert!(annex[1..].iter().all(|s| s == "minecraft:air"));
 }
 
 #[test]

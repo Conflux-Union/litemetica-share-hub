@@ -5,9 +5,13 @@ use std::collections::HashMap;
 pub const MC_DATA_VERSIONS: &str = include_str!("../data/mc_data_versions.json");
 pub const BLOCK_NAMES_ZH_CN: &str = include_str!("../data/block_names_zh_cn.json");
 
+/// Binary preview payload magic (`LPRV` = Litematica Preview).
+pub const PREVIEW_MAGIC: [u8; 4] = *b"LPRV";
+
 /// Preview payload schema version.
-/// 1 = palette carried bare block ids; 2 = palette carries full state strings.
-pub const PREVIEW_SCHEMA_VERSION: u32 = 2;
+/// 1 = palette carried bare block ids; 2 = palette carried full state strings
+/// in gzip-compressed JSON; 3 = binary LPRV layout with LEB128 varints.
+pub const PREVIEW_SCHEMA_VERSION: u32 = 3;
 
 /// Map a Minecraft data version to the release it belongs to (or the closest older release).
 pub fn mc_version_name(data_version: i64) -> String {
@@ -34,7 +38,7 @@ pub struct MaterialEntry {
     pub count: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct RegionPreview {
     pub name: String,
     pub pos: [i64; 3],
@@ -46,9 +50,9 @@ pub struct RegionPreview {
     pub rle: Vec<[u64; 2]>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct PreviewData {
-    pub schema: u32,
+    /// Enclosing size of all regions; every component is positive.
     pub size: [i64; 3],
     pub regions: Vec<RegionPreview>,
 }
@@ -68,6 +72,77 @@ pub struct ParsedSchematic {
     pub total_blocks: u64,
     pub materials: Vec<MaterialEntry>,
     pub preview: PreviewData,
+}
+
+/// Append `value` as an unsigned LEB128 varint (base-128, little-endian
+/// groups, continuation bit in the MSB).
+fn write_uvarint(out: &mut Vec<u8>, value: u64) {
+    let mut v = value;
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if v == 0 {
+            return;
+        }
+    }
+}
+
+/// Append `value` as a zigzag-encoded signed LEB128 varint, so small
+/// negative values (region positions and sizes) stay compact.
+fn write_varint(out: &mut Vec<u8>, value: i64) {
+    write_uvarint(out, ((value << 1) ^ (value >> 63)) as u64);
+}
+
+/// Serialize a preview payload into the binary schema-3 format:
+///
+/// - 4-byte magic `LPRV`, then `u8` version 3;
+/// - `uvarint dx, dy, dz` enclosing size (always positive);
+/// - `uvarint regionCount`, then per region: `uvarint nameLen` + UTF-8 name,
+///   zigzag varints for `pos` (x,y,z) and `size` (x,y,z), `uvarint
+///   paletteCount` + length-prefixed canonical state strings, and
+///   `uvarint runCount` + `(uvarint paletteIdx, uvarint runLength)` pairs.
+///
+/// Semantics are identical to the schema-2 JSON payload: RLE order is x
+/// fastest, then z, then y; a region palette's index 0 is not guaranteed to
+/// be air; region-local coordinates cover `0..|size|` with the minimum corner
+/// at `pos + min(0, size + 1)`. The caller gzip-compresses the result before
+/// storage or transfer.
+pub fn preview_bytes(preview: &PreviewData) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&PREVIEW_MAGIC);
+    out.push(PREVIEW_SCHEMA_VERSION as u8);
+    for axis in preview.size {
+        write_uvarint(
+            &mut out,
+            u64::try_from(axis).expect("enclosing size is positive"),
+        );
+    }
+    write_uvarint(&mut out, preview.regions.len() as u64);
+    for region in &preview.regions {
+        write_uvarint(&mut out, region.name.len() as u64);
+        out.extend_from_slice(region.name.as_bytes());
+        for v in region.pos {
+            write_varint(&mut out, v);
+        }
+        for v in region.size {
+            write_varint(&mut out, v);
+        }
+        write_uvarint(&mut out, region.palette.len() as u64);
+        for state in &region.palette {
+            write_uvarint(&mut out, state.len() as u64);
+            out.extend_from_slice(state.as_bytes());
+        }
+        write_uvarint(&mut out, region.rle.len() as u64);
+        for [idx, len] in &region.rle {
+            write_uvarint(&mut out, *idx);
+            write_uvarint(&mut out, *len);
+        }
+    }
+    out
 }
 
 /// Format a block state as the canonical state string `name[k=v,...]` with
@@ -314,7 +389,6 @@ pub fn parse_litematic(bytes: &[u8], decompress_limit: u64) -> Result<ParsedSche
         total_blocks,
         materials,
         preview: PreviewData {
-            schema: PREVIEW_SCHEMA_VERSION,
             size: [
                 i64::from(enclosing[0]),
                 i64::from(enclosing[1]),
@@ -392,5 +466,74 @@ mod tests {
             "minecraft:oak_stairs"
         );
         assert_eq!(bare_block_name("minecraft:stone"), "minecraft:stone");
+    }
+
+    #[test]
+    fn uvarint_encoding_matches_leb128_spec() {
+        let enc = |v: u64| {
+            let mut out = Vec::new();
+            write_uvarint(&mut out, v);
+            out
+        };
+        assert_eq!(enc(0), [0x00]);
+        assert_eq!(enc(1), [0x01]);
+        assert_eq!(enc(127), [0x7f]);
+        assert_eq!(enc(128), [0x80, 0x01]);
+        assert_eq!(enc(300), [0xac, 0x02]);
+        assert_eq!(enc(16383), [0xff, 0x7f]);
+        assert_eq!(enc(16384), [0x80, 0x80, 0x01]);
+        assert_eq!(
+            enc(u64::MAX),
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+        );
+    }
+
+    #[test]
+    fn varint_encoding_zigzags_signed_values() {
+        let enc = |v: i64| {
+            let mut out = Vec::new();
+            write_varint(&mut out, v);
+            out
+        };
+        assert_eq!(enc(0), [0x00]);
+        assert_eq!(enc(-1), [0x01]);
+        assert_eq!(enc(1), [0x02]);
+        assert_eq!(enc(-2), [0x03]);
+        assert_eq!(enc(2), [0x04]);
+        // i32::MIN zigzags to 0xFFFFFFFF, a 5-byte varint.
+        assert_eq!(enc(-2147483648), [0xff, 0xff, 0xff, 0xff, 0x0f]);
+    }
+
+    #[test]
+    fn preview_bytes_layout_matches_schema3() {
+        // Golden bytes pinning the wire layout the frontend decoder implements.
+        let preview = PreviewData {
+            size: [7, 3, 4],
+            regions: vec![RegionPreview {
+                name: "annex".into(),
+                pos: [6, 0, 3],
+                size: [-2, 2, -3],
+                palette: vec!["minecraft:air".into(), "minecraft:stone".into()],
+                rle: vec![[1, 1], [0, 5]],
+            }],
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"LPRV");
+        expected.push(3);
+        expected.extend([7u8, 3, 4]); // enclosing size uvarints
+        expected.push(1); // regionCount
+        expected.push(5); // nameLen
+        expected.extend_from_slice(b"annex");
+        expected.extend([12u8, 0, 6]); // zigzag pos 6,0,3
+        expected.extend([3u8, 4, 5]); // zigzag size -2,2,-3
+        expected.push(2); // paletteCount
+        expected.push(13); // "minecraft:air".len()
+        expected.extend_from_slice(b"minecraft:air");
+        expected.push(15); // "minecraft:stone".len()
+        expected.extend_from_slice(b"minecraft:stone");
+        expected.push(2); // runCount
+        expected.extend([1u8, 1]); // run: paletteIdx 1, length 1
+        expected.extend([0u8, 5]); // run: paletteIdx 0, length 5
+        assert_eq!(preview_bytes(&preview), expected);
     }
 }
