@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const TILE: u32 = 16;
-const BUNDLE_FORMAT_VERSION: u32 = 2;
+const BUNDLE_FORMAT_VERSION: u32 = 3;
 
 pub struct TextureOptions {
     pub version: Option<String>,
@@ -190,15 +190,50 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
     // real block models from the entity textures, with facing/type variants,
     // and crop the 64x64 entity layouts into per-face atlas tiles.
     let mut derived_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
-    let mut families = synthesize_chests(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    let mut families = synthesize_chests(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
     // 2.6. The other block-entity families get the same treatment, and the
     // bare face-texture refs of shipped models (heavy_core) are normalized.
-    families += synthesize_shulker_boxes(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
-    families += synthesize_banners(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
-    families += synthesize_heads(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
-    families += synthesize_golem_statues(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
-    families += synthesize_conduits(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
-    families += synthesize_decorated_pots(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_shulker_boxes(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
+    families += synthesize_banners(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
+    families += synthesize_heads(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
+    families += synthesize_golem_statues(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
+    families += synthesize_conduits(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
+    families += synthesize_decorated_pots(
+        &mut block_states,
+        &mut raw_models,
+        &mut archive,
+        &mut derived_tiles,
+    );
     families += synthesize_end_portals(&mut block_states, &mut raw_models);
     families += synthesize_lava(&mut block_states, &mut raw_models);
     let fixed_refs = normalize_face_texture_refs(&mut raw_models);
@@ -222,9 +257,41 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
         .filter_map(|key| raw_models.get(key).map(|v| (key.clone(), v.clone())))
         .collect();
 
+    // 3.5. Item models for the material universe. The material table lists
+    // block_to_item ids, and vanilla shows several of them (redstone, rails,
+    // bell, torches, seeds, …) as item models — flat sprites or dedicated
+    // elements — rather than the placed block. Keep their parent closures so
+    // the frontend icon renderer can prefer the item, like the inventory.
+    let item_seeds: Vec<String> = block_states
+        .keys()
+        .filter_map(|key| {
+            let block = key.strip_prefix("minecraft:block/")?;
+            let item = crate::schematics::parse::block_to_item(&format!("minecraft:{block}"))?;
+            Some(format!(
+                "minecraft:item/{}",
+                item.trim_start_matches("minecraft:")
+            ))
+        })
+        .collect();
+    let item_closure = collect_model_closure(&raw_models, item_seeds);
+    println!(
+        "item-model closure: {} models for material items",
+        item_closure.len()
+    );
+    let item_models: Map<String, Value> = item_closure
+        .iter()
+        .filter(|key| !closure.contains(*key))
+        .filter_map(|key| raw_models.get(key).map(|v| ((key).clone(), v.clone())))
+        .collect();
+
     // 4. Collect every texture referenced by a reachable model.
     let mut texture_ids: BTreeSet<String> = BTreeSet::new();
     for key in &closure {
+        for id in model_texture_ids(&raw_models[key]) {
+            texture_ids.insert(id);
+        }
+    }
+    for key in &item_closure {
         for id in model_texture_ids(&raw_models[key]) {
             texture_ids.insert(id);
         }
@@ -286,7 +353,12 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
     for (i, id) in ordered.iter().enumerate() {
         let col = (i as u32) % grid;
         let row = (i as u32) / grid;
-        image::imageops::overlay(&mut atlas, &tiles[*id], (col * TILE) as i64, (row * TILE) as i64);
+        image::imageops::overlay(
+            &mut atlas,
+            &tiles[*id],
+            (col * TILE) as i64,
+            (row * TILE) as i64,
+        );
         uv.insert((*id).clone(), [col, row]);
     }
 
@@ -326,6 +398,7 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
         "tile": TILE,
         "blockStates": block_states,
         "blockModels": block_models,
+        "itemModels": item_models,
         "textures": textures_json,
         "tintColors": tint_colors,
     });
@@ -390,12 +463,42 @@ struct Rect {
 /// [lateral, front, lateral, back] in the second.
 fn box_face_rects(w: u32, h: u32, d: u32, u: u32, v: u32) -> [Rect; 6] {
     [
-        Rect { x: u + d, y: v, w, h: d },
-        Rect { x: u + d + w, y: v, w, h: d },
-        Rect { x: u + d, y: v + d, w, h },
-        Rect { x: u + 2 * d + w, y: v + d, w, h },
-        Rect { x: u, y: v + d, w: d, h },
-        Rect { x: u + d + w, y: v + d, w: d, h },
+        Rect {
+            x: u + d,
+            y: v,
+            w,
+            h: d,
+        },
+        Rect {
+            x: u + d + w,
+            y: v,
+            w,
+            h: d,
+        },
+        Rect {
+            x: u + d,
+            y: v + d,
+            w,
+            h,
+        },
+        Rect {
+            x: u + 2 * d + w,
+            y: v + d,
+            w,
+            h,
+        },
+        Rect {
+            x: u,
+            y: v + d,
+            w: d,
+            h,
+        },
+        Rect {
+            x: u + d + w,
+            y: v + d,
+            w: d,
+            h,
+        },
     ]
 }
 
@@ -478,9 +581,18 @@ fn chest_model_json(
 ) -> Value {
     let bw = if half { 15u32 } else { 14u32 };
     let (base, base_tex) = chest_part_element(
-        src, derived_tiles, tile_prefix, "base",
-        [x0, 0.0, 1.0], [x1, 10.0, 15.0],
-        bw, 10, 14, 0, 19, half,
+        src,
+        derived_tiles,
+        tile_prefix,
+        "base",
+        [x0, 0.0, 1.0],
+        [x1, 10.0, 15.0],
+        bw,
+        10,
+        14,
+        0,
+        19,
+        half,
     );
     // The lid insets to avoid z-fighting the base's coplanar side walls,
     // but a half keeps its seam edge flush: an inset there opens a hairline
@@ -489,14 +601,27 @@ fn chest_model_json(
     // z-fight, and the neighbor's box occludes them. Halves are placed by
     // x0: right hugs the west edge (seam at x0), left the east edge (x1).
     let (lid_x0, lid_x1) = if half {
-        if x0 == 0.0 { (x0, x1 - CHEST_EPS) } else { (x0 + CHEST_EPS, x1) }
+        if x0 == 0.0 {
+            (x0, x1 - CHEST_EPS)
+        } else {
+            (x0 + CHEST_EPS, x1)
+        }
     } else {
         (x0 + CHEST_EPS, x1 - CHEST_EPS)
     };
     let (lid, lid_tex) = chest_part_element(
-        src, derived_tiles, tile_prefix, "lid",
-        [lid_x0, 9.0, 1.0 + CHEST_EPS], [lid_x1, 14.0, 15.0 - CHEST_EPS],
-        bw, 5, 14, 0, 0, half,
+        src,
+        derived_tiles,
+        tile_prefix,
+        "lid",
+        [lid_x0, 9.0, 1.0 + CHEST_EPS],
+        [lid_x1, 14.0, 15.0 - CHEST_EPS],
+        bw,
+        5,
+        14,
+        0,
+        0,
+        half,
     );
     let mut elements = vec![base, lid];
     let mut textures = base_tex;
@@ -511,12 +636,21 @@ fn chest_model_json(
     // file (art at (1,0)) on the right type; each piece's seam-side face
     // samples a transparent column hidden against the neighbor's latch.
     let (latch_x, latch_w, latch_u) = if half {
-        if x0 == 0.0 { ((0.0, 1.0), 1u32, 1u32) } else { ((15.0, 16.0), 1u32, 0u32) }
+        if x0 == 0.0 {
+            ((0.0, 1.0), 1u32, 1u32)
+        } else {
+            ((15.0, 16.0), 1u32, 0u32)
+        }
     } else {
         ((7.0, 9.0), 2u32, 0u32)
     };
     let latch_tile = format!("{tile_prefix}__latch");
-    let latch_region = Rect { x: latch_u, y: 0, w: 4 + latch_w, h: 5 };
+    let latch_region = Rect {
+        x: latch_u,
+        y: 0,
+        w: 4 + latch_w,
+        h: 5,
+    };
     derived_tiles
         .entry(latch_tile.clone())
         .or_insert_with(|| crop_tile(src, latch_region, false));
@@ -563,7 +697,9 @@ fn synthesize_chests(
         let mut load = |stem: &str| -> Option<image::RgbaImage> {
             let zip_name = format!("assets/minecraft/textures/entity/chest/{stem}.png");
             let bytes = read_zip_file(archive, &zip_name)?;
-            image::load_from_memory(&bytes).ok().map(|img| img.to_rgba8())
+            image::load_from_memory(&bytes)
+                .ok()
+                .map(|img| img.to_rgba8())
         };
         let Some(single_src) = load(stem) else {
             eprintln!("[chest] {stem}.png missing from jar; {state_key} keeps placeholder");
@@ -817,7 +953,9 @@ fn load_entity_texture(
     path: &str,
 ) -> Option<image::RgbaImage> {
     let bytes = read_zip_file(archive, &format!("assets/minecraft/textures/{path}.png"))?;
-    image::load_from_memory(&bytes).ok().map(|img| img.to_rgba8())
+    image::load_from_memory(&bytes)
+        .ok()
+        .map(|img| img.to_rgba8())
 }
 
 /// "" plus the four horizontal facings as y quarter turns (golem statues,
@@ -826,7 +964,10 @@ fn variants_empty_and_facing(model_id: &str) -> Map<String, Value> {
     let mut variants = Map::new();
     variants.insert("".into(), json!({ "model": model_id }));
     for (facing, y) in [("north", 0), ("east", 90), ("south", 180), ("west", 270)] {
-        variants.insert(format!("facing={facing}"), json!({ "model": model_id, "y": y }));
+        variants.insert(
+            format!("facing={facing}"),
+            json!({ "model": model_id, "y": y }),
+        );
     }
     variants
 }
@@ -885,7 +1026,11 @@ fn bake_y_rotation(model: &Value, deg: f64) -> Value {
                 (from[2] + to[2]) / 2.0,
             ];
             let moved = rotate_y_about(center, axis, deg);
-            let half = [(to[0] - from[0]) / 2.0, (to[1] - from[1]) / 2.0, (to[2] - from[2]) / 2.0];
+            let half = [
+                (to[0] - from[0]) / 2.0,
+                (to[1] - from[1]) / 2.0,
+                (to[2] - from[2]) / 2.0,
+            ];
             el["from"] = json!([moved[0] - half[0], moved[1] - half[1], moved[2] - half[2]]);
             el["to"] = json!([moved[0] + half[0], moved[1] + half[1], moved[2] + half[2]]);
             if let Some(origin) = el
@@ -936,7 +1081,8 @@ fn shulker_texture_stem(block_id: &str) -> Option<String> {
     if name == "shulker_box" {
         Some("shulker".into())
     } else {
-        name.strip_suffix("_shulker_box").map(|c| format!("shulker_{c}"))
+        name.strip_suffix("_shulker_box")
+            .map(|c| format!("shulker_{c}"))
     }
 }
 
@@ -972,8 +1118,28 @@ fn synthesize_shulker_boxes(
             &src,
             derived_tiles,
             &[
-                box_spec(&tile_prefix, "base", [0.0, 0.0, 0.0], [16.0, 8.0, 16.0], 16, 8, 16, 0, 28),
-                box_spec(&tile_prefix, "lid", [0.0, 4.0, 0.0], [16.0, 16.0, 16.0], 16, 12, 16, 0, 0),
+                box_spec(
+                    &tile_prefix,
+                    "base",
+                    [0.0, 0.0, 0.0],
+                    [16.0, 8.0, 16.0],
+                    16,
+                    8,
+                    16,
+                    0,
+                    28,
+                ),
+                box_spec(
+                    &tile_prefix,
+                    "lid",
+                    [0.0, 4.0, 0.0],
+                    [16.0, 16.0, 16.0],
+                    16,
+                    12,
+                    16,
+                    0,
+                    0,
+                ),
             ],
             "#lid_up",
         );
@@ -1041,10 +1207,40 @@ fn synthesize_banners(
         // Standing: pole x/z 7.33..8.67 y0..28, crossbar y28..29.33, cloth
         // hanging the full pole length just south of it.
         let standing_specs = vec![
-            box_spec(wood_prefix, "pole", [7.33, 0.0, 7.33], [8.67, 28.0, 8.67], 2, 42, 2, 44, 0),
-            box_spec(wood_prefix, "bar", [1.33, 28.0, 7.33], [14.67, 29.33, 8.67], 20, 2, 2, 0, 42),
-            box_spec(&cloth_prefix, "flag", [1.33, 2.67, 8.67], [14.67, 29.33, 9.33], 20, 40, 1, 0, 0)
-                .tinted(rgb),
+            box_spec(
+                wood_prefix,
+                "pole",
+                [7.33, 0.0, 7.33],
+                [8.67, 28.0, 8.67],
+                2,
+                42,
+                2,
+                44,
+                0,
+            ),
+            box_spec(
+                wood_prefix,
+                "bar",
+                [1.33, 28.0, 7.33],
+                [14.67, 29.33, 8.67],
+                20,
+                2,
+                2,
+                0,
+                42,
+            ),
+            box_spec(
+                &cloth_prefix,
+                "flag",
+                [1.33, 2.67, 8.67],
+                [14.67, 29.33, 9.33],
+                20,
+                40,
+                1,
+                0,
+                0,
+            )
+            .tinted(rgb),
         ];
         let standing_id = format!("minecraft:block/{block}_synthetic");
         let standing = entity_box_model(&base, derived_tiles, &standing_specs, "#flag_north");
@@ -1073,15 +1269,41 @@ fn synthesize_banners(
         // Wall (facing=north base geometry): crossbar flush under the block
         // top against the wall, cloth hanging past the block bottom.
         let wall_specs = vec![
-            box_spec(wood_prefix, "bar", [1.33, 13.67, 14.5], [14.67, 15.17, 16.0], 20, 2, 2, 0, 42),
-            box_spec(&cloth_prefix, "flag", [1.33, -13.0, 13.67], [14.67, 13.67, 14.33], 20, 40, 1, 0, 0)
-                .tinted(rgb),
+            box_spec(
+                wood_prefix,
+                "bar",
+                [1.33, 13.67, 14.5],
+                [14.67, 15.17, 16.0],
+                20,
+                2,
+                2,
+                0,
+                42,
+            ),
+            box_spec(
+                &cloth_prefix,
+                "flag",
+                [1.33, -13.0, 13.67],
+                [14.67, 13.67, 14.33],
+                20,
+                40,
+                1,
+                0,
+                0,
+            )
+            .tinted(rgb),
         ];
         let wall_id = format!("minecraft:block/{wall_block}_synthetic");
-        raw_models.insert(wall_id.clone(), entity_box_model(&base, derived_tiles, &wall_specs, "#flag_north"));
+        raw_models.insert(
+            wall_id.clone(),
+            entity_box_model(&base, derived_tiles, &wall_specs, "#flag_north"),
+        );
         let mut wall_variants = Map::new();
         for (facing, y) in [("north", 0), ("east", 90), ("south", 180), ("west", 270)] {
-            wall_variants.insert(format!("facing={facing}"), json!({ "model": wall_id, "y": y }));
+            wall_variants.insert(
+                format!("facing={facing}"),
+                json!({ "model": wall_id, "y": y }),
+            );
         }
         block_states.insert(
             format!("minecraft:block/{wall_block}"),
@@ -1104,7 +1326,11 @@ fn synthesize_banners(
 const HEAD_KINDS: [(&str, &str, &str); 7] = [
     ("creeper_head", "creeper_wall_head", "creeper/creeper"),
     ("skeleton_skull", "skeleton_wall_skull", "skeleton/skeleton"),
-    ("wither_skeleton_skull", "wither_skeleton_wall_skull", "skeleton/wither_skeleton"),
+    (
+        "wither_skeleton_skull",
+        "wither_skeleton_wall_skull",
+        "skeleton/wither_skeleton",
+    ),
     ("zombie_head", "zombie_wall_head", "zombie/zombie"),
     ("player_head", "player_wall_head", "player/slim/steve"),
     ("piglin_head", "piglin_wall_head", "piglin/piglin"),
@@ -1119,29 +1345,169 @@ const HEAD_KINDS: [(&str, &str, &str); 7] = [
 /// edge, mouth closed).
 fn head_box_specs(prefix: &str) -> Vec<BoxSpec> {
     let simple = |prefix: &str| {
-        vec![box_spec(prefix, "head", [4.0, 0.0, 4.0], [12.0, 8.0, 12.0], 8, 8, 8, 0, 0)]
+        vec![box_spec(
+            prefix,
+            "head",
+            [4.0, 0.0, 4.0],
+            [12.0, 8.0, 12.0],
+            8,
+            8,
+            8,
+            0,
+            0,
+        )]
     };
     let piglin = |prefix: &str| {
         vec![
-            box_spec(prefix, "skull", [3.0, 0.0, 4.0], [13.0, 8.0, 12.0], 10, 8, 8, 0, 0),
-            box_spec(prefix, "snout", [6.0, 1.0, 3.0], [10.0, 5.0, 4.0], 4, 4, 1, 31, 1),
-            box_spec(prefix, "tusk_left", [5.0, 0.0, 3.0], [6.0, 2.0, 4.0], 1, 2, 1, 2, 4),
-            box_spec(prefix, "tusk_right", [10.0, 0.0, 3.0], [11.0, 2.0, 4.0], 1, 2, 1, 2, 0),
-            box_spec(prefix, "ear_left", [2.0, 3.0, 4.0], [3.0, 8.0, 8.0], 1, 5, 4, 51, 6)
-                .rotated([2.5, 3.0, 6.0], "z", 30.0),
-            box_spec(prefix, "ear_right", [13.0, 3.0, 4.0], [14.0, 8.0, 8.0], 1, 5, 4, 39, 6)
-                .rotated([13.5, 3.0, 6.0], "z", -30.0),
+            box_spec(
+                prefix,
+                "skull",
+                [3.0, 0.0, 4.0],
+                [13.0, 8.0, 12.0],
+                10,
+                8,
+                8,
+                0,
+                0,
+            ),
+            box_spec(
+                prefix,
+                "snout",
+                [6.0, 1.0, 3.0],
+                [10.0, 5.0, 4.0],
+                4,
+                4,
+                1,
+                31,
+                1,
+            ),
+            box_spec(
+                prefix,
+                "tusk_left",
+                [5.0, 0.0, 3.0],
+                [6.0, 2.0, 4.0],
+                1,
+                2,
+                1,
+                2,
+                4,
+            ),
+            box_spec(
+                prefix,
+                "tusk_right",
+                [10.0, 0.0, 3.0],
+                [11.0, 2.0, 4.0],
+                1,
+                2,
+                1,
+                2,
+                0,
+            ),
+            box_spec(
+                prefix,
+                "ear_left",
+                [2.0, 3.0, 4.0],
+                [3.0, 8.0, 8.0],
+                1,
+                5,
+                4,
+                51,
+                6,
+            )
+            .rotated([2.5, 3.0, 6.0], "z", 30.0),
+            box_spec(
+                prefix,
+                "ear_right",
+                [13.0, 3.0, 4.0],
+                [14.0, 8.0, 8.0],
+                1,
+                5,
+                4,
+                39,
+                6,
+            )
+            .rotated([13.5, 3.0, 6.0], "z", -30.0),
         ]
     };
     let dragon = |prefix: &str| {
         vec![
-            box_spec(prefix, "upper_head", [2.0, 0.0, 2.0], [14.0, 12.0, 14.0], 16, 16, 16, 112, 30),
-            box_spec(prefix, "upper_lip", [3.5, 4.0, -6.0], [12.5, 7.75, 6.0], 12, 5, 16, 176, 44),
-            box_spec(prefix, "jaw", [3.5, 1.0, -6.0], [12.5, 4.0, 6.0], 12, 4, 16, 176, 65),
-            box_spec(prefix, "scale_left", [0.5, 7.0, 8.0], [2.0, 10.0, 12.5], 2, 4, 6, 0, 0),
-            box_spec(prefix, "scale_right", [14.0, 7.0, 8.0], [15.5, 10.0, 12.5], 2, 4, 6, 0, 0),
-            box_spec(prefix, "nostril_left", [5.0, 7.75, -3.0], [6.5, 9.25, 0.0], 2, 2, 4, 112, 0),
-            box_spec(prefix, "nostril_right", [9.5, 7.75, -3.0], [11.0, 9.25, 0.0], 2, 2, 4, 112, 0),
+            box_spec(
+                prefix,
+                "upper_head",
+                [2.0, 0.0, 2.0],
+                [14.0, 12.0, 14.0],
+                16,
+                16,
+                16,
+                112,
+                30,
+            ),
+            box_spec(
+                prefix,
+                "upper_lip",
+                [3.5, 4.0, -6.0],
+                [12.5, 7.75, 6.0],
+                12,
+                5,
+                16,
+                176,
+                44,
+            ),
+            box_spec(
+                prefix,
+                "jaw",
+                [3.5, 1.0, -6.0],
+                [12.5, 4.0, 6.0],
+                12,
+                4,
+                16,
+                176,
+                65,
+            ),
+            box_spec(
+                prefix,
+                "scale_left",
+                [0.5, 7.0, 8.0],
+                [2.0, 10.0, 12.5],
+                2,
+                4,
+                6,
+                0,
+                0,
+            ),
+            box_spec(
+                prefix,
+                "scale_right",
+                [14.0, 7.0, 8.0],
+                [15.5, 10.0, 12.5],
+                2,
+                4,
+                6,
+                0,
+                0,
+            ),
+            box_spec(
+                prefix,
+                "nostril_left",
+                [5.0, 7.75, -3.0],
+                [6.5, 9.25, 0.0],
+                2,
+                2,
+                4,
+                112,
+                0,
+            ),
+            box_spec(
+                prefix,
+                "nostril_right",
+                [9.5, 7.75, -3.0],
+                [11.0, 9.25, 0.0],
+                2,
+                2,
+                4,
+                112,
+                0,
+            ),
         ]
     };
     match prefix.rsplit('/').next().unwrap_or("") {
@@ -1194,7 +1560,12 @@ fn synthesize_heads(
 
         let floor_specs = head_box_specs(&tile_prefix);
         let floor_id = format!("minecraft:block/{floor_block}_synthetic");
-        let floor = entity_box_model(&src, derived_tiles, &floor_specs, &format!("#{first_part}_north"));
+        let floor = entity_box_model(
+            &src,
+            derived_tiles,
+            &floor_specs,
+            &format!("#{first_part}_north"),
+        );
         raw_models.insert(floor_id.clone(), floor.clone());
         let mut residual_models = vec![floor_id.clone()];
         for s in 1..4u32 {
@@ -1222,7 +1593,12 @@ fn synthesize_heads(
         let wall_id = format!("minecraft:block/{wall_block}_synthetic");
         raw_models.insert(
             wall_id.clone(),
-            entity_box_model(&src, derived_tiles, &wall_specs, &format!("#{first_part}_north")),
+            entity_box_model(
+                &src,
+                derived_tiles,
+                &wall_specs,
+                &format!("#{first_part}_north"),
+            ),
         );
         block_states.insert(
             format!("minecraft:block/{wall_block}"),
@@ -1268,22 +1644,117 @@ fn synthesize_golem_statues(
     // One model per oxidation texture; waxed blockstates share them (their
     // vanilla blockstates also point at the unwaxed model ids).
     let mut models: HashMap<&'static str, String> = HashMap::new();
-    for stem in ["copper_golem", "copper_golem_exposed", "copper_golem_weathered", "copper_golem_oxidized"] {
+    for stem in [
+        "copper_golem",
+        "copper_golem_exposed",
+        "copper_golem_weathered",
+        "copper_golem_oxidized",
+    ] {
         let Some(src) = load_entity_texture(archive, &format!("entity/copper_golem/{stem}")) else {
             eprintln!("[golem] entity/copper_golem/{stem}.png missing");
             continue;
         };
         let tile_prefix = format!("minecraft:entity/copper_golem/{stem}");
         let specs = vec![
-            box_spec(&tile_prefix, "leg_left", [4.0, 0.0, 6.0], [8.0, 5.0, 10.0], 4, 5, 4, 0, 27),
-            box_spec(&tile_prefix, "leg_right", [8.0, 0.0, 6.0], [12.0, 5.0, 10.0], 4, 5, 4, 16, 27),
-            box_spec(&tile_prefix, "body", [4.0, 5.0, 5.0], [12.0, 11.0, 11.0], 8, 6, 6, 0, 15),
-            box_spec(&tile_prefix, "arm_left", [1.0, 6.0, 6.0], [4.0, 16.0, 10.0], 3, 10, 4, 36, 16),
-            box_spec(&tile_prefix, "arm_right", [12.0, 6.0, 6.0], [15.0, 16.0, 10.0], 3, 10, 4, 50, 16),
-            box_spec(&tile_prefix, "skull", [4.0, 11.0, 3.0], [12.0, 16.0, 13.0], 8, 5, 10, 0, 0),
-            box_spec(&tile_prefix, "nose", [7.0, 12.0, 2.0], [9.0, 15.0, 4.0], 2, 3, 2, 56, 0),
-            box_spec(&tile_prefix, "antenna_stalk", [7.0, 16.0, 7.0], [9.0, 20.0, 9.0], 2, 4, 2, 37, 8),
-            box_spec(&tile_prefix, "antenna_block", [6.0, 20.0, 6.0], [10.0, 24.0, 10.0], 4, 4, 4, 37, 0),
+            box_spec(
+                &tile_prefix,
+                "leg_left",
+                [4.0, 0.0, 6.0],
+                [8.0, 5.0, 10.0],
+                4,
+                5,
+                4,
+                0,
+                27,
+            ),
+            box_spec(
+                &tile_prefix,
+                "leg_right",
+                [8.0, 0.0, 6.0],
+                [12.0, 5.0, 10.0],
+                4,
+                5,
+                4,
+                16,
+                27,
+            ),
+            box_spec(
+                &tile_prefix,
+                "body",
+                [4.0, 5.0, 5.0],
+                [12.0, 11.0, 11.0],
+                8,
+                6,
+                6,
+                0,
+                15,
+            ),
+            box_spec(
+                &tile_prefix,
+                "arm_left",
+                [1.0, 6.0, 6.0],
+                [4.0, 16.0, 10.0],
+                3,
+                10,
+                4,
+                36,
+                16,
+            ),
+            box_spec(
+                &tile_prefix,
+                "arm_right",
+                [12.0, 6.0, 6.0],
+                [15.0, 16.0, 10.0],
+                3,
+                10,
+                4,
+                50,
+                16,
+            ),
+            box_spec(
+                &tile_prefix,
+                "skull",
+                [4.0, 11.0, 3.0],
+                [12.0, 16.0, 13.0],
+                8,
+                5,
+                10,
+                0,
+                0,
+            ),
+            box_spec(
+                &tile_prefix,
+                "nose",
+                [7.0, 12.0, 2.0],
+                [9.0, 15.0, 4.0],
+                2,
+                3,
+                2,
+                56,
+                0,
+            ),
+            box_spec(
+                &tile_prefix,
+                "antenna_stalk",
+                [7.0, 16.0, 7.0],
+                [9.0, 20.0, 9.0],
+                2,
+                4,
+                2,
+                37,
+                8,
+            ),
+            box_spec(
+                &tile_prefix,
+                "antenna_block",
+                [6.0, 20.0, 6.0],
+                [10.0, 24.0, 10.0],
+                4,
+                4,
+                4,
+                37,
+                0,
+            ),
         ];
         let model_id = format!("minecraft:block/{stem}_statue_synthetic");
         raw_models.insert(
@@ -1295,7 +1766,9 @@ fn synthesize_golem_statues(
     let mut count = 0;
     for state_key in keys {
         let stem = golem_texture_stem(&state_key).unwrap();
-        let Some(model_id) = models.get(stem) else { continue };
+        let Some(model_id) = models.get(stem) else {
+            continue;
+        };
         block_states.insert(
             state_key,
             json!({ "variants": variants_empty_and_facing(model_id) }),
@@ -1333,11 +1806,31 @@ fn synthesize_conduits(
     for (src, spec) in [
         (
             &shell_src,
-            box_spec("minecraft:entity/conduit/base", "shell", [5.0, 5.0, 5.0], [11.0, 11.0, 11.0], 6, 6, 6, 0, 0),
+            box_spec(
+                "minecraft:entity/conduit/base",
+                "shell",
+                [5.0, 5.0, 5.0],
+                [11.0, 11.0, 11.0],
+                6,
+                6,
+                6,
+                0,
+                0,
+            ),
         ),
         (
             &cage_src,
-            box_spec("minecraft:entity/conduit/cage", "cage", [4.0, 4.0, 4.0], [12.0, 12.0, 12.0], 8, 8, 8, 0, 0),
+            box_spec(
+                "minecraft:entity/conduit/cage",
+                "cage",
+                [4.0, 4.0, 4.0],
+                [12.0, 12.0, 12.0],
+                8,
+                8,
+                8,
+                0,
+                0,
+            ),
         ),
     ] {
         let (element, tex) = entity_box_element(src, derived_tiles, &spec);
@@ -1348,8 +1841,14 @@ fn synthesize_conduits(
     }
     textures.insert("particle".into(), json!("#shell_north"));
     let model_id = "minecraft:block/conduit_synthetic";
-    raw_models.insert(model_id.into(), json!({ "textures": textures, "elements": elements }));
-    block_states.insert(state_key.into(), json!({ "variants": { "": { "model": model_id } } }));
+    raw_models.insert(
+        model_id.into(),
+        json!({ "textures": textures, "elements": elements }),
+    );
+    block_states.insert(
+        state_key.into(),
+        json!({ "variants": { "": { "model": model_id } } }),
+    );
     1
 }
 
@@ -1394,7 +1893,12 @@ fn synthesize_decorated_pots(
     ];
     for (dir, from, to) in walls {
         let tile_id = format!("{side_prefix}__{dir}");
-        let r = Rect { x: 1, y: 0, w: 14, h: 16 };
+        let r = Rect {
+            x: 1,
+            y: 0,
+            w: 14,
+            h: 16,
+        };
         derived_tiles
             .entry(tile_id.clone())
             .or_insert_with(|| crop_tile_scaled(&side_src, r, false, None).0);
@@ -1407,8 +1911,28 @@ fn synthesize_decorated_pots(
 
     // Shoulder (up) and base (down) planes from the base texture.
     let planes = [
-        ("up", [1.0, 16.0, 1.0], [15.0, 16.0, 15.0], Rect { x: 0, y: 13, w: 14, h: 14 }),
-        ("down", [1.0, 0.0, 1.0], [15.0, 0.0, 15.0], Rect { x: 14, y: 13, w: 14, h: 14 }),
+        (
+            "up",
+            [1.0, 16.0, 1.0],
+            [15.0, 16.0, 15.0],
+            Rect {
+                x: 0,
+                y: 13,
+                w: 14,
+                h: 14,
+            },
+        ),
+        (
+            "down",
+            [1.0, 0.0, 1.0],
+            [15.0, 0.0, 15.0],
+            Rect {
+                x: 14,
+                y: 13,
+                w: 14,
+                h: 14,
+            },
+        ),
     ];
     for (dir, from, to, r) in planes {
         let tile_id = format!("{base_prefix}__{dir}");
@@ -1427,8 +1951,18 @@ fn synthesize_decorated_pots(
     let (neck, neck_tex) = entity_box_element(
         &base_src,
         derived_tiles,
-        &box_spec(base_prefix, "neck", [4.0, 13.0, 4.0], [12.0, 16.0, 12.0], 8, 3, 8, 0, 0)
-            .skipping(&["up"]),
+        &box_spec(
+            base_prefix,
+            "neck",
+            [4.0, 13.0, 4.0],
+            [12.0, 16.0, 12.0],
+            8,
+            3,
+            8,
+            0,
+            0,
+        )
+        .skipping(&["up"]),
     );
     elements.push(neck);
     for (k, v) in neck_tex {
@@ -1437,8 +1971,14 @@ fn synthesize_decorated_pots(
     textures.insert("particle".into(), json!("#north"));
 
     let model_id = "minecraft:block/decorated_pot_synthetic";
-    raw_models.insert(model_id.into(), json!({ "textures": textures, "elements": elements }));
-    block_states.insert(state_key.into(), json!({ "variants": { "": { "model": model_id } } }));
+    raw_models.insert(
+        model_id.into(),
+        json!({ "textures": textures, "elements": elements }),
+    );
+    block_states.insert(
+        state_key.into(),
+        json!({ "variants": { "": { "model": model_id } } }),
+    );
     1
 }
 
@@ -1491,11 +2031,17 @@ fn synthesize_lava(
         return 0;
     }
     let model_id = "minecraft:block/lava_synthetic";
-    raw_models.insert(model_id.into(), full_cube_model("minecraft:block/lava_still"));
+    raw_models.insert(
+        model_id.into(),
+        full_cube_model("minecraft:block/lava_still"),
+    );
     // A single "" variant also covers level=0..15 (pickVariant falls back
     // to it), and the full cube makes surface.ts occlusion/AO apply —
     // lava is an opaque fluid in vanilla.
-    block_states.insert(key.into(), json!({ "variants": { "": { "model": model_id } } }));
+    block_states.insert(
+        key.into(),
+        json!({ "variants": { "": { "model": model_id } } }),
+    );
     1
 }
 
@@ -1746,7 +2292,11 @@ fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
 pub async fn serve_bundle(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
 ) -> Result<axum::response::Response, AppError> {
-    let path = state.config.data_dir.join("textures").join("bundle.json.gz");
+    let path = state
+        .config
+        .data_dir
+        .join("textures")
+        .join("bundle.json.gz");
     let bytes = std::fs::read(&path).map_err(|_| AppError::NotFound)?;
     Ok((
         axum::http::StatusCode::OK,
@@ -1823,15 +2373,24 @@ mod tests {
             assert!(is_known_translucent(path), "{path} should be translucent");
         }
         for path in ["block/stone", "block/grass_block_top", "block/oak_leaves"] {
-            assert!(!is_known_translucent(path), "{path} should stay as classified");
+            assert!(
+                !is_known_translucent(path),
+                "{path} should stay as classified"
+            );
         }
         // Cutout-classified glass becomes translucent; already-opaque stays opaque.
         let cutout_glass = image::RgbaImage::from_fn(2, 1, |x, _| {
             image::Rgba([200, 200, 200, if x == 0 { 0 } else { 255 }])
         });
-        assert_eq!(classify_texture_alpha(&cutout_glass, "block/glass"), AlphaClass::Translucent);
+        assert_eq!(
+            classify_texture_alpha(&cutout_glass, "block/glass"),
+            AlphaClass::Translucent
+        );
         let opaque_glass = image::RgbaImage::from_pixel(2, 1, image::Rgba([200, 200, 200, 255]));
-        assert_eq!(classify_texture_alpha(&opaque_glass, "block/glass"), AlphaClass::Opaque);
+        assert_eq!(
+            classify_texture_alpha(&opaque_glass, "block/glass"),
+            AlphaClass::Opaque
+        );
     }
 
     #[test]
@@ -1870,10 +2429,15 @@ mod tests {
         );
         assert_eq!(
             closure,
-            ["minecraft:block/a", "minecraft:block/b", "minecraft:block/c", "minecraft:block/d"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
+            [
+                "minecraft:block/a",
+                "minecraft:block/b",
+                "minecraft:block/c",
+                "minecraft:block/d"
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
         );
 
         let cyclic = collect_model_closure(&models, vec!["minecraft:block/x".into()]);
@@ -1945,7 +2509,7 @@ mod tests {
         assert_rect(&base[1], 28, 19, 14, 14); // down
         assert_rect(&base[2], 14, 33, 14, 10); // north
         assert_rect(&base[3], 42, 33, 14, 10); // south
-        assert_rect(&base[4], 0, 33, 14, 10);  // west lateral
+        assert_rect(&base[4], 0, 33, 14, 10); // west lateral
         assert_rect(&base[5], 28, 33, 14, 10); // east lateral
         let lid = box_face_rects(14, 5, 14, 0, 0);
         assert_rect(&lid[0], 14, 0, 14, 14);
@@ -1970,14 +2534,24 @@ mod tests {
             image::Rgba([(x * 4) as u8, (y * 4) as u8, 128, 255])
         });
         let mut tiles: HashMap<String, image::RgbaImage> = HashMap::new();
-        let model = chest_model_json(&src, &mut tiles, "minecraft:entity/chest/test", 1.0, 15.0, false);
+        let model = chest_model_json(
+            &src,
+            &mut tiles,
+            "minecraft:entity/chest/test",
+            1.0,
+            15.0,
+            false,
+        );
 
         let elements = model["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 3, "base + lid + latch");
         // Base sits inside the block; lid is inset to avoid coplanar sides.
         assert_eq!(elements[0]["from"], json!([1.0, 0.0, 1.0]));
         assert_eq!(elements[0]["to"], json!([15.0, 10.0, 15.0]));
-        assert_eq!(elements[1]["to"], json!([15.0 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS]));
+        assert_eq!(
+            elements[1]["to"],
+            json!([15.0 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS])
+        );
         let latch = &elements[2];
         assert_eq!(latch["from"], json!([7.0, 7.0, 0.0]));
         assert_eq!(latch["to"], json!([9.0, 11.0, 1.0]));
@@ -2000,16 +2574,32 @@ mod tests {
         // the north/south tiles (entity-vs-block side-face u direction),
         // and hugs a 1-wide latch to the seam.
         let mut half_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
-        let half = chest_model_json(&src, &mut half_tiles, "minecraft:entity/chest/test_h", 0.0, 15.0, true);
+        let half = chest_model_json(
+            &src,
+            &mut half_tiles,
+            "minecraft:entity/chest/test_h",
+            0.0,
+            15.0,
+            true,
+        );
         assert_eq!(half["elements"].as_array().unwrap().len(), 3);
         assert_eq!(half["elements"][0]["from"], json!([0.0, 0.0, 1.0]));
         // Right half hugs the west edge (seam at x0): lid starts flush there.
-        assert_eq!(half["elements"][1]["from"], json!([0.0, 9.0, 1.0 + CHEST_EPS]));
-        assert_eq!(half["elements"][1]["to"], json!([15.0 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS]));
+        assert_eq!(
+            half["elements"][1]["from"],
+            json!([0.0, 9.0, 1.0 + CHEST_EPS])
+        );
+        assert_eq!(
+            half["elements"][1]["to"],
+            json!([15.0 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS])
+        );
         // Latch hugs the same seam edge; its texOffs is (1,0) for right halves.
         assert_eq!(half["elements"][2]["from"], json!([0.0, 7.0, 0.0]));
         assert_eq!(half["elements"][2]["to"], json!([1.0, 11.0, 1.0]));
-        assert_eq!(half["elements"][2]["faces"]["north"]["uv"], json!([1, 1, 2, 5]));
+        assert_eq!(
+            half["elements"][2]["faces"]["north"]["uv"],
+            json!([1, 1, 2, 5])
+        );
         // North/south tiles flip; up/down and laterals do not.
         let h_up = &half_tiles["minecraft:entity/chest/test_h__lid_up"];
         assert_eq!(h_up.get_pixel(0, 0), src.get_pixel(29, 0));
@@ -2020,11 +2610,27 @@ mod tests {
         assert_eq!(h_west.get_pixel(0, 0), src.get_pixel(0, 33));
         // The left half hugs the east edge: seam flush at x1, latch at (0,0).
         let mut left_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
-        let left = chest_model_json(&src, &mut left_tiles, "minecraft:entity/chest/test_l", 1.0, 16.0, true);
-        assert_eq!(left["elements"][1]["from"], json!([1.0 + CHEST_EPS, 9.0, 1.0 + CHEST_EPS]));
-        assert_eq!(left["elements"][1]["to"], json!([16.0, 14.0, 15.0 - CHEST_EPS]));
+        let left = chest_model_json(
+            &src,
+            &mut left_tiles,
+            "minecraft:entity/chest/test_l",
+            1.0,
+            16.0,
+            true,
+        );
+        assert_eq!(
+            left["elements"][1]["from"],
+            json!([1.0 + CHEST_EPS, 9.0, 1.0 + CHEST_EPS])
+        );
+        assert_eq!(
+            left["elements"][1]["to"],
+            json!([16.0, 14.0, 15.0 - CHEST_EPS])
+        );
         assert_eq!(left["elements"][2]["from"], json!([15.0, 7.0, 0.0]));
-        assert_eq!(left["elements"][2]["faces"]["north"]["uv"], json!([1, 1, 2, 5]));
+        assert_eq!(
+            left["elements"][2]["faces"]["north"]["uv"],
+            json!([1, 1, 2, 5])
+        );
     }
 
     #[test]
@@ -2034,7 +2640,10 @@ mod tests {
             chest_texture_stem("minecraft:block/trapped_chest"),
             Some("normal")
         );
-        assert_eq!(chest_texture_stem("minecraft:block/ender_chest"), Some("ender"));
+        assert_eq!(
+            chest_texture_stem("minecraft:block/ender_chest"),
+            Some("ender")
+        );
         assert_eq!(
             chest_texture_stem("minecraft:block/waxed_exposed_copper_chest"),
             Some("copper_exposed")
@@ -2118,10 +2727,19 @@ mod tests {
         assert_eq!((lid[1].x, lid[1].y, lid[1].w, lid[1].h), (32, 0, 16, 16));
         assert_eq!((lid[2].x, lid[2].y, lid[2].w, lid[2].h), (16, 16, 16, 12));
         let base = box_face_rects(16, 8, 16, 0, 28);
-        assert_eq!((base[0].x, base[0].y, base[0].w, base[0].h), (16, 28, 16, 16));
-        assert_eq!((base[3].x, base[3].y, base[3].w, base[3].h), (48, 44, 16, 8));
+        assert_eq!(
+            (base[0].x, base[0].y, base[0].w, base[0].h),
+            (16, 28, 16, 16)
+        );
+        assert_eq!(
+            (base[3].x, base[3].y, base[3].w, base[3].h),
+            (48, 44, 16, 8)
+        );
         // Both 17 shulker textures are 64x64 (plain + 16 dye colors).
-        assert_eq!(shulker_texture_stem("minecraft:block/shulker_box").as_deref(), Some("shulker"));
+        assert_eq!(
+            shulker_texture_stem("minecraft:block/shulker_box").as_deref(),
+            Some("shulker")
+        );
         assert_eq!(
             shulker_texture_stem("minecraft:block/purple_shulker_box").as_deref(),
             Some("shulker_purple")
@@ -2132,14 +2750,23 @@ mod tests {
     #[test]
     fn synthesizes_shulker_family_end_to_end() {
         let bytes = zip_from_textures(&[
-            ("assets/minecraft/textures/entity/shulker/shulker.png", synth_texture(64, 64)),
-            ("assets/minecraft/textures/entity/shulker/shulker_purple.png", synth_texture(64, 64)),
+            (
+                "assets/minecraft/textures/entity/shulker/shulker.png",
+                synth_texture(64, 64),
+            ),
+            (
+                "assets/minecraft/textures/entity/shulker/shulker_purple.png",
+                synth_texture(64, 64),
+            ),
         ]);
         let mut archive = open_zip(&bytes).unwrap();
         let mut states = empty_states(&["shulker_box", "purple_shulker_box"]);
         let mut models = HashMap::new();
         let mut tiles = HashMap::new();
-        assert_eq!(synthesize_shulker_boxes(&mut states, &mut models, &mut archive, &mut tiles), 2);
+        assert_eq!(
+            synthesize_shulker_boxes(&mut states, &mut models, &mut archive, &mut tiles),
+            2
+        );
 
         let model = &models["minecraft:block/shulker_box_synthetic"];
         let elements = model["elements"].as_array().unwrap();
@@ -2165,7 +2792,9 @@ mod tests {
         let base_north = &tiles["minecraft:entity/shulker/shulker__base_north"];
         assert_eq!(base_north.get_pixel(0, 0), src.get_pixel(31, 44));
 
-        let variants = states["minecraft:block/shulker_box"]["variants"].as_object().unwrap();
+        let variants = states["minecraft:block/shulker_box"]["variants"]
+            .as_object()
+            .unwrap();
         assert_eq!(variants.len(), 7);
         assert_eq!(
             variants["facing=east"],
@@ -2184,15 +2813,49 @@ mod tests {
     fn crop_tile_scaled_fits_downscales_and_tints() {
         let src = image::RgbaImage::from_pixel(64, 64, image::Rgba([241, 241, 241, 255]));
         // Regions that fit keep their size.
-        let (tile, w, h) = crop_tile_scaled(&src, Rect { x: 0, y: 0, w: 8, h: 10 }, false, None);
+        let (tile, w, h) = crop_tile_scaled(
+            &src,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 10,
+            },
+            false,
+            None,
+        );
         assert_eq!((w, h), (8, 10));
         assert_eq!(tile.get_pixel(7, 9).0, [241, 241, 241, 255]);
         // Oversized regions scale to fit: the banner flag 20x40 -> 8x16.
-        let (tile, w, h) = crop_tile_scaled(&src, Rect { x: 1, y: 1, w: 20, h: 40 }, false, None);
+        let (tile, w, h) = crop_tile_scaled(
+            &src,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 20,
+                h: 40,
+            },
+            false,
+            None,
+        );
         assert_eq!((w, h), (8, 16));
-        assert_eq!(tile.get_pixel(8, 0).0[3], 0, "padded margin stays transparent");
+        assert_eq!(
+            tile.get_pixel(8, 0).0[3],
+            0,
+            "padded margin stays transparent"
+        );
         // Tint premultiplies each channel (banner cloth dyeing).
-        let (tile, _, _) = crop_tile_scaled(&src, Rect { x: 0, y: 0, w: 2, h: 2 }, false, Some([128, 64, 255]));
+        let (tile, _, _) = crop_tile_scaled(
+            &src,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            false,
+            Some([128, 64, 255]),
+        );
         assert_eq!(
             tile.get_pixel(0, 0).0,
             [
@@ -2207,7 +2870,17 @@ mod tests {
         for x in 0..4 {
             asym.put_pixel(x, 0, image::Rgba([x as u8, 0, 0, 255]));
         }
-        let (tile, _, _) = crop_tile_scaled(&asym, Rect { x: 0, y: 0, w: 4, h: 1 }, true, None);
+        let (tile, _, _) = crop_tile_scaled(
+            &asym,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 1,
+            },
+            true,
+            None,
+        );
         assert_eq!(tile.get_pixel(0, 0).0[0], 3);
     }
 
@@ -2222,7 +2895,10 @@ mod tests {
         let mut states = empty_states(&["white_banner", "white_wall_banner"]);
         let mut models = HashMap::new();
         let mut tiles = HashMap::new();
-        assert_eq!(synthesize_banners(&mut states, &mut models, &mut archive, &mut tiles), 32);
+        assert_eq!(
+            synthesize_banners(&mut states, &mut models, &mut archive, &mut tiles),
+            32
+        );
 
         let standing = &models["minecraft:block/white_banner_synthetic"];
         let els = standing["elements"].as_array().unwrap();
@@ -2241,18 +2917,35 @@ mod tests {
             r1["elements"][0]["rotation"],
             json!({ "origin": [8.0, 0.0, 8.0], "axis": "y", "angle": -22.5 })
         );
-        let variants = states["minecraft:block/white_banner"]["variants"].as_object().unwrap();
+        let variants = states["minecraft:block/white_banner"]["variants"]
+            .as_object()
+            .unwrap();
         assert_eq!(variants.len(), 16);
-        assert_eq!(variants["rotation=0"]["model"], json!("minecraft:block/white_banner_synthetic"));
-        assert_eq!(variants["rotation=4"], json!({ "model": "minecraft:block/white_banner_synthetic", "y": 90 }));
-        assert_eq!(variants["rotation=5"], json!({ "model": "minecraft:block/white_banner_synthetic_r1", "y": 90 }));
-        assert_eq!(variants["rotation=15"]["model"], json!("minecraft:block/white_banner_synthetic_r3"));
+        assert_eq!(
+            variants["rotation=0"]["model"],
+            json!("minecraft:block/white_banner_synthetic")
+        );
+        assert_eq!(
+            variants["rotation=4"],
+            json!({ "model": "minecraft:block/white_banner_synthetic", "y": 90 })
+        );
+        assert_eq!(
+            variants["rotation=5"],
+            json!({ "model": "minecraft:block/white_banner_synthetic_r1", "y": 90 })
+        );
+        assert_eq!(
+            variants["rotation=15"]["model"],
+            json!("minecraft:block/white_banner_synthetic_r3")
+        );
 
         // Wall form: facings via y quarter turns, cloth hangs below the
         // block (vanilla 26.3 wall-banner proportions).
         let wall = &models["minecraft:block/white_wall_banner_synthetic"];
         assert_eq!(wall["elements"][1]["from"], json!([1.33, -13.0, 13.67]));
-        assert_eq!(states["minecraft:block/white_wall_banner"]["variants"]["facing=east"]["y"], json!(90));
+        assert_eq!(
+            states["minecraft:block/white_wall_banner"]["variants"]["facing=east"]["y"],
+            json!(90)
+        );
 
         // Dye tint: white cloth premultiplied by the dye color (magenta
         // 199,78,189); the wooden pole/bar tiles stay untinted and shared
@@ -2276,8 +2969,14 @@ mod tests {
     #[test]
     fn synthesizes_heads_floor_and_wall() {
         let bytes = zip_from_textures(&[
-            ("assets/minecraft/textures/entity/creeper/creeper.png", synth_texture(64, 32)),
-            ("assets/minecraft/textures/entity/piglin/piglin.png", synth_texture(64, 64)),
+            (
+                "assets/minecraft/textures/entity/creeper/creeper.png",
+                synth_texture(64, 32),
+            ),
+            (
+                "assets/minecraft/textures/entity/piglin/piglin.png",
+                synth_texture(64, 64),
+            ),
         ]);
         let mut archive = open_zip(&bytes).unwrap();
         let mut states = empty_states(&[
@@ -2290,7 +2989,10 @@ mod tests {
         let mut tiles = HashMap::new();
         // Only creeper and piglin textures exist in the fixture zip; the
         // other five kinds keep their placeholder blockstates.
-        assert_eq!(synthesize_heads(&mut states, &mut models, &mut archive, &mut tiles), 4);
+        assert_eq!(
+            synthesize_heads(&mut states, &mut models, &mut archive, &mut tiles),
+            4
+        );
 
         let floor = &models["minecraft:block/creeper_head_synthetic"];
         assert_eq!(floor["elements"][0]["from"], json!([4.0, 0.0, 4.0]));
@@ -2299,13 +3001,17 @@ mod tests {
         assert_eq!(wall["elements"][0]["from"], json!([4.0, 4.0, 8.0]));
         assert_eq!(wall["elements"][0]["to"], json!([12.0, 12.0, 16.0]));
 
-        let floor_variants = states["minecraft:block/creeper_head"]["variants"].as_object().unwrap();
+        let floor_variants = states["minecraft:block/creeper_head"]["variants"]
+            .as_object()
+            .unwrap();
         assert_eq!(floor_variants.len(), 16);
         assert_eq!(
             floor_variants["rotation=7"],
             json!({ "model": "minecraft:block/creeper_head_synthetic_r3", "y": 90 })
         );
-        let wall_variants = states["minecraft:block/creeper_wall_head"]["variants"].as_object().unwrap();
+        let wall_variants = states["minecraft:block/creeper_wall_head"]["variants"]
+            .as_object()
+            .unwrap();
         assert_eq!(wall_variants.len(), 5);
         assert_eq!(wall_variants["facing=south"]["y"], json!(180));
 
@@ -2328,8 +3034,14 @@ mod tests {
         );
         assert_eq!(baked["elements"][4]["rotation"]["angle"], json!(30.0));
         let moved = rotate_y_about([2.5, 5.5, 6.0], [8.0, 0.0, 8.0], -45.0);
-        assert_eq!(baked["elements"][4]["from"][0].as_f64().unwrap(), moved[0] - 0.5);
-        assert_eq!(baked["elements"][4]["to"][1].as_f64().unwrap(), moved[1] + 2.5);
+        assert_eq!(
+            baked["elements"][4]["from"][0].as_f64().unwrap(),
+            moved[0] - 0.5
+        );
+        assert_eq!(
+            baked["elements"][4]["to"][1].as_f64().unwrap(),
+            moved[1] + 2.5
+        );
     }
 
     #[test]
@@ -2357,8 +3069,16 @@ mod tests {
         let els = model["elements"].as_array().unwrap();
         assert_eq!(els.len(), 9);
         assert_eq!(els[5]["from"], json!([4.0, 11.0, 3.0]), "skull");
-        assert_eq!(els[6]["from"], json!([7.0, 12.0, 2.0]), "nose at low z (faces north)");
-        assert_eq!(els[8]["to"], json!([10.0, 24.0, 10.0]), "antenna ball tops out at y24");
+        assert_eq!(
+            els[6]["from"],
+            json!([7.0, 12.0, 2.0]),
+            "nose at low z (faces north)"
+        );
+        assert_eq!(
+            els[8]["to"],
+            json!([10.0, 24.0, 10.0]),
+            "antenna ball tops out at y24"
+        );
         assert_eq!(
             states["minecraft:block/waxed_copper_golem_statue"]["variants"]["facing=east"],
             json!({ "model": "minecraft:block/copper_golem_statue_synthetic", "y": 90 })
@@ -2373,17 +3093,38 @@ mod tests {
     #[test]
     fn synthesizes_conduit_pot_end_portals_and_lava() {
         let bytes = zip_from_textures(&[
-            ("assets/minecraft/textures/entity/conduit/base.png", synth_texture(32, 16)),
-            ("assets/minecraft/textures/entity/conduit/cage.png", synth_texture(32, 16)),
-            ("assets/minecraft/textures/entity/decorated_pot/decorated_pot_base.png", synth_texture(32, 32)),
-            ("assets/minecraft/textures/entity/decorated_pot/decorated_pot_side.png", synth_texture(16, 16)),
+            (
+                "assets/minecraft/textures/entity/conduit/base.png",
+                synth_texture(32, 16),
+            ),
+            (
+                "assets/minecraft/textures/entity/conduit/cage.png",
+                synth_texture(32, 16),
+            ),
+            (
+                "assets/minecraft/textures/entity/decorated_pot/decorated_pot_base.png",
+                synth_texture(32, 32),
+            ),
+            (
+                "assets/minecraft/textures/entity/decorated_pot/decorated_pot_side.png",
+                synth_texture(16, 16),
+            ),
         ]);
         let mut archive = open_zip(&bytes).unwrap();
-        let mut states = empty_states(&["conduit", "decorated_pot", "end_portal", "end_gateway", "lava"]);
+        let mut states = empty_states(&[
+            "conduit",
+            "decorated_pot",
+            "end_portal",
+            "end_gateway",
+            "lava",
+        ]);
         let mut models = HashMap::new();
         let mut tiles = HashMap::new();
 
-        assert_eq!(synthesize_conduits(&mut states, &mut models, &mut archive, &mut tiles), 1);
+        assert_eq!(
+            synthesize_conduits(&mut states, &mut models, &mut archive, &mut tiles),
+            1
+        );
         let conduit = &models["minecraft:block/conduit_synthetic"];
         let els = conduit["elements"].as_array().unwrap();
         assert_eq!(els.len(), 2);
@@ -2391,22 +3132,38 @@ mod tests {
         assert_eq!(els[1]["to"], json!([12.0, 12.0, 12.0]), "cage");
         assert_eq!(conduit["textures"]["particle"], json!("#shell_north"));
 
-        assert_eq!(synthesize_decorated_pots(&mut states, &mut models, &mut archive, &mut tiles), 1);
+        assert_eq!(
+            synthesize_decorated_pots(&mut states, &mut models, &mut archive, &mut tiles),
+            1
+        );
         let pot = &models["minecraft:block/decorated_pot_synthetic"];
         let els = pot["elements"].as_array().unwrap();
         assert_eq!(els.len(), 7, "4 walls + shoulder + base + neck");
         assert_eq!(els[0]["faces"]["north"]["uv"], json!([0, 0, 14, 16]));
-        assert_eq!(els[0]["faces"].as_object().unwrap().len(), 1, "walls are one-faced planes");
+        assert_eq!(
+            els[0]["faces"].as_object().unwrap().len(),
+            1,
+            "walls are one-faced planes"
+        );
         assert_eq!(els[4]["faces"]["up"]["uv"], json!([0, 0, 14, 14]));
         let neck = &els[6];
-        assert!(neck["faces"].get("up").is_none(), "neck top hidden under the shoulder plane");
+        assert!(
+            neck["faces"].get("up").is_none(),
+            "neck top hidden under the shoulder plane"
+        );
         assert_eq!(neck["faces"].as_object().unwrap().len(), 5);
 
         assert_eq!(synthesize_end_portals(&mut states, &mut models), 2);
         let end_model = &models["minecraft:block/end_portal_synthetic"];
-        assert_eq!(end_model["textures"]["all"], json!("minecraft:entity/end_portal/end_portal"));
+        assert_eq!(
+            end_model["textures"]["all"],
+            json!("minecraft:entity/end_portal/end_portal")
+        );
         for dir in ["up", "down", "north", "south", "west", "east"] {
-            assert_eq!(end_model["elements"][0]["faces"][dir]["cullface"], json!(dir));
+            assert_eq!(
+                end_model["elements"][0]["faces"][dir]["cullface"],
+                json!(dir)
+            );
         }
         assert_eq!(
             states["minecraft:block/end_gateway"]["variants"][""]["model"],
@@ -2457,10 +3214,23 @@ mod tests {
 
         assert_eq!(normalize_face_texture_refs(&mut models), 1);
         let heavy = &models["minecraft:block/heavy_core"];
-        assert_eq!(heavy["elements"][0]["faces"]["north"]["texture"], json!("#all"));
-        assert_eq!(heavy["elements"][0]["faces"]["up"]["texture"], json!("#all"));
-        assert_eq!(heavy["textures"]["all"], json!("block/heavy_core"), "texture map untouched");
+        assert_eq!(
+            heavy["elements"][0]["faces"]["north"]["texture"],
+            json!("#all")
+        );
+        assert_eq!(
+            heavy["elements"][0]["faces"]["up"]["texture"],
+            json!("#all")
+        );
+        assert_eq!(
+            heavy["textures"]["all"],
+            json!("block/heavy_core"),
+            "texture map untouched"
+        );
         let cube = &models["minecraft:block/cube"];
-        assert_eq!(cube["elements"][0]["faces"]["north"]["texture"], json!("block/stone"));
+        assert_eq!(
+            cube["elements"][0]["faces"]["north"]["texture"],
+            json!("block/stone")
+        );
     }
 }

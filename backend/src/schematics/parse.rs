@@ -132,7 +132,9 @@ fn is_excluded_block(name: &str) -> bool {
 }
 
 /// Map a block id to the item id players actually need to craft/place it.
-fn block_to_item(block: &str) -> Option<String> {
+/// Shared with the texture extractor, which uses it to collect item models
+/// for the material universe (several items render as sprites, not blocks).
+pub(crate) fn block_to_item(block: &str) -> Option<String> {
     let name = block.strip_prefix("minecraft:").unwrap_or(block);
     if is_excluded_block(block) {
         return None;

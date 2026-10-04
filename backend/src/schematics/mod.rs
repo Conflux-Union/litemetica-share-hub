@@ -442,7 +442,10 @@ mod regen_tests {
     }
 
     fn redstone_wire(power: &str) -> GenericBlockState {
-        let props: Vec<(std::borrow::Cow<'static, str>, std::borrow::Cow<'static, str>)> = vec![
+        let props: Vec<(
+            std::borrow::Cow<'static, str>,
+            std::borrow::Cow<'static, str>,
+        )> = vec![
             ("north".to_string().into(), "up".to_string().into()),
             ("east".to_string().into(), "side".to_string().into()),
             ("south".to_string().into(), "side".to_string().into()),

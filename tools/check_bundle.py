@@ -91,6 +91,35 @@ def check_bundle_shape(bundle: dict, data_dir: str, errors: list[str]) -> None:
     if "minecraft:entity/chest/normal__base_up" not in bundle.get("textures", {}):
         errors.append("textures is missing derived chest tile normal__base_up")
 
+    # The material universe carries item models: vanilla shows several
+    # material items (redstone, rails, bell, torches, seeds, …) as item
+    # sprites, not placed-block models.
+    item_models = bundle.get("itemModels")
+    if not isinstance(item_models, dict) or not item_models:
+        errors.append("bundle.itemModels is missing or empty")
+        item_models = {}
+    else:
+        for item_id in ("minecraft:item/redstone", "minecraft:item/bell", "minecraft:item/rail"):
+            if item_id not in item_models:
+                errors.append(f"itemModels is missing {item_id}")
+        for item_id, model in item_models.items():
+            if not isinstance(model, dict):
+                errors.append(f"item model {item_id} is not an object")
+                break
+            for tex in (model.get("textures") or {}).values():
+                ref = tex.get("sprite") if isinstance(tex, dict) else tex
+                if not isinstance(ref, str) or ref.startswith("#"):
+                    continue
+                # Model files mix bare ("block/conduit") and namespaced refs;
+                # atlas keys are always namespaced.
+                namespaced = ref if ":" in ref else f"minecraft:{ref}"
+                if namespaced not in bundle.get("textures", {}):
+                    errors.append(f"item model {item_id} references texture missing from atlas: {ref}")
+        if "minecraft:item/redstone" in item_models:
+            layer0 = item_models["minecraft:item/redstone"].get("textures", {}).get("layer0")
+            if layer0 != "minecraft:item/redstone":
+                errors.append(f"redstone item sprite should use item/redstone, got {layer0!r}")
+
 
     textures = bundle.get("textures")
     if not isinstance(textures, dict):
@@ -127,8 +156,8 @@ def check_bundle_shape(bundle: dict, data_dir: str, errors: list[str]) -> None:
         if not (isinstance(color, list) and len(color) == 3 and all(0 <= c <= 255 for c in color)):
             errors.append(f"tintColors.{key} is not an [r,g,b] 0..255 triple: {color!r}")
 
-    if bundle.get("formatVersion") != 2:
-        errors.append(f"bundle.formatVersion is {bundle.get('formatVersion')!r}, expected 2")
+    if bundle.get("formatVersion") != 3:
+        errors.append(f"bundle.formatVersion is {bundle.get('formatVersion')!r}, expected 3")
 
 
 def check_previews(data_dir: str, errors: list[str]) -> None:
