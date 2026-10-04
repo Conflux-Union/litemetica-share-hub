@@ -17,11 +17,6 @@ function toggleTheme() {
 function goLogin() {
   window.location.href = '/api/auth/login'
 }
-
-// Restore the persisted theme before first paint of interactive elements.
-if (localStorage.getItem('lsh-theme') === 'dark') {
-  document.documentElement.setAttribute('data-theme', 'dark')
-}
 </script>
 
 <template>

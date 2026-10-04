@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Litemetica Share Hub</title>
+    <script>
+      // Apply the persisted theme (or the system preference on first
+      // visit) before first paint to avoid a white flash.
+      ;(() => {
+        const stored = localStorage.getItem('lsh-theme')
+        const dark = stored ? stored === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches
+        if (dark) document.documentElement.setAttribute('data-theme', 'dark')
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

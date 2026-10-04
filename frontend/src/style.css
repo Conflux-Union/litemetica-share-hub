@@ -10,6 +10,17 @@ body {
   padding: 0;
 }
 
+/* The paper-and-ink theme lives in zhimo-ui tokens; apply it to the page
+   itself so the app canvas is paper, not the browser default white. */
+body {
+  background: var(--zhimo-bg, #faf7f0);
+  color: var(--zhimo-fg, #1a1714);
+  font-family: var(--zhimo-font, Georgia, serif);
+  transition:
+    background-color var(--zhimo-transition, 180ms ease),
+    color var(--zhimo-transition, 180ms ease);
+}
+
 #app {
   min-height: 100vh;
   display: flex;
@@ -41,8 +52,15 @@ body {
 }
 
 .muted {
-  color: var(--zhimo-ink-soft, #6b6257);
+  color: var(--zhimo-fg-muted, #7a7265);
   font-size: 0.85rem;
+}
+
+/* Full-width page-level loading state (list / detail / upload). */
+.page-loader {
+  display: flex;
+  justify-content: center;
+  padding: 4rem 0;
 }
 
 .meta-grid {
@@ -53,13 +71,13 @@ body {
 
 .meta-item {
   padding: 0.5rem 0.75rem;
-  border: 1px solid var(--zhimo-line, #d8d0c4);
-  border-radius: var(--zhimo-radius, 8px);
+  border: 1px solid var(--zhimo-border, #e0d9c8);
+  border-radius: var(--zhimo-radius, 4px);
 }
 
 .meta-item .label {
   font-size: 0.75rem;
-  color: var(--zhimo-ink-soft, #6b6257);
+  color: var(--zhimo-fg-muted, #7a7265);
 }
 
 .meta-item .value {
@@ -79,33 +97,32 @@ body {
 .data-table td {
   text-align: left;
   padding: 0.5rem 0.6rem;
-  border-bottom: 1px solid var(--zhimo-line, #e2dcd2);
+  border-bottom: 1px solid var(--zhimo-border, #e0d9c8);
 }
 
 .data-table th {
   font-size: 0.78rem;
-  color: var(--zhimo-ink-soft, #6b6257);
+  color: var(--zhimo-fg-muted, #7a7265);
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
 }
 
 .data-table tbody tr:hover {
-  background: var(--zhimo-paper-raised, rgba(0, 0, 0, 0.03));
+  background: var(--zhimo-bg-hover, #eee8d8);
 }
 
 .block-icon {
   display: inline-block;
   width: 20px;
   height: 20px;
-  image-rendering: pixelated;
   vertical-align: middle;
   border-radius: 3px;
 }
 
 .file-drop {
-  border: 2px dashed var(--zhimo-line, #cfc6b8);
-  border-radius: var(--zhimo-radius, 10px);
+  border: 2px dashed var(--zhimo-border-strong, #c6bca6);
+  border-radius: var(--zhimo-radius, 4px);
   padding: 2.5rem 1.5rem;
   text-align: center;
   cursor: pointer;
@@ -113,8 +130,8 @@ body {
 }
 
 .file-drop.dragover {
-  border-color: var(--zhimo-seal, #b3452c);
-  background: rgba(179, 69, 44, 0.05);
+  border-color: var(--zhimo-seal, #b8432f);
+  background: rgba(184, 67, 47, 0.06);
 }
 
 .file-drop.has-file {
@@ -123,10 +140,10 @@ body {
 
 .viewer-shell {
   position: relative;
-  border: 1px solid var(--zhimo-line, #d8d0c4);
-  border-radius: var(--zhimo-radius, 10px);
+  border: 1px solid var(--zhimo-border, #e0d9c8);
+  border-radius: var(--zhimo-radius, 4px);
   overflow: hidden;
-  background: var(--zhimo-paper, #f6f2e9);
+  background: var(--zhimo-bg-subtle, #f3eee1);
   height: min(64vh, 620px);
 }
 
@@ -139,10 +156,10 @@ body {
   right: 0.6rem;
   bottom: 0.5rem;
   font-size: 0.72rem;
-  color: var(--zhimo-ink-soft, #8a8175);
-  background: rgba(246, 242, 233, 0.75);
+  color: var(--zhimo-fg-muted, #968d7c);
+  background: color-mix(in srgb, var(--zhimo-bg, #faf7f0) 78%, transparent);
   padding: 0.15rem 0.5rem;
-  border-radius: 6px;
+  border-radius: var(--zhimo-radius-sm, 2px);
   pointer-events: none;
 }
 
@@ -162,8 +179,4 @@ body {
   max-width: 420px;
   margin: 3rem auto;
   text-align: center;
-}
-
-[data-theme='dark'] .data-table tbody tr:hover {
-  background: rgba(255, 255, 255, 0.04);
 }
