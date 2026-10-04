@@ -16,3 +16,6 @@ config.toml
 # Editor/OS
 .DS_Store
 *.swp
+
+# Playwright MCP screenshots
+.playwright-mcp/
