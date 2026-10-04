@@ -10,6 +10,7 @@ import type { AssetBundle } from '../types'
 import {
   asMeshRequest,
   asMeshResponse,
+  BOX_NOTICE,
   buildMeshRequest,
   handleMeshRequest,
   meshTransferList,
@@ -107,6 +108,34 @@ function stoneBundle(): AssetBundle {
     },
     tintColors: {},
   }
+}
+
+/** One textured slab model (bottom half cube) — a non-cube state the
+ * box-proxy tier collapses into mergeable whole blocks. */
+function slabBundle(): AssetBundle {
+  const bundle = stoneBundle()
+  bundle.blockStates['minecraft:block/test_slab'] = {
+    variants: { '': { model: 'minecraft:block/test_slab' } },
+  }
+  bundle.blockModels['minecraft:block/test_slab'] = {
+    textures: { all: { sprite: 'minecraft:block/slab_side' } },
+    elements: [
+      {
+        from: [0, 0, 0],
+        to: [16, 8, 16],
+        faces: {
+          up: { texture: '#all', cullface: 'up' },
+          down: { texture: '#all', cullface: 'down' },
+          north: { texture: '#all', cullface: 'north' },
+          south: { texture: '#all', cullface: 'south' },
+          west: { texture: '#all', cullface: 'west' },
+          east: { texture: '#all', cullface: 'east' },
+        },
+      },
+    ],
+  }
+  bundle.textures['minecraft:block/slab_side'] = { uv: [0, 1], alpha: 'opaque' }
+  return bundle
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +296,23 @@ describe('runMeshPipeline', () => {
     // The 8³ grid downsamples to one stride-8 cell: a six-quad cube.
     expect(result.mesh.faceCount).toBe(6)
     expect(result.mesh.ranges.flat.count).toBe(result.mesh.indices.length)
+  })
+
+  it('falls back to the textured box-proxy tier before the coarse LOD', () => {
+    // 4x1x4 of textured slabs: full detail emits ~6 quads per slab (non-cube
+    // template path), so a budget of 8 trips the guardrail. The box-proxy
+    // retry renders each slab as a whole block wearing the slab texture —
+    // greedy-mergeable, so the platform collapses to six merged quads.
+    const gz = toBuffer(encodePreview([4, 1, 4], ['minecraft:test_slab'], [[0, 16]]))
+    const result = runMeshPipeline(gz, slabBundle(), undefined, { maxQuads: 8 })
+    expect(result.degraded).toBe(true)
+    expect(result.notice).toBe(BOX_NOTICE)
+    // Under the LOD threshold: the box mesh renders alone, no coarse twin.
+    expect(result.coarse).toBeNull()
+    expect(result.mesh.faceCount).toBe(6)
+    expect(result.mesh.ranges.opaque.count).toBe(result.mesh.indices.length)
+    // Merged 4-block spans tile the texture: local uv reaches 4*16.
+    expect(Math.max(...result.mesh.uvs)).toBe(64)
   })
 
   it('builds the coarse LOD mesh alongside the full mesh above the threshold', () => {

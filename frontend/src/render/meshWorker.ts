@@ -12,9 +12,11 @@
  *                                      — every mesh buffer transferred
  *                                        zero-copy; `coarse` is the LOD mesh
  *                                        for distance switching (null when
- *                                        not built), `degraded`+`notice`
- *                                        mark a budget fallback where `mesh`
- *                                        already is the coarse mesh
+ *                                        not built); `degraded`+`notice`
+ *                                        mark a budget fallback — the
+ *                                        box-proxy tier (textured
+ *                                        whole-block approximation) or the
+ *                                        coarse mesh replacing the render
  *     { type: 'error', message }       — pipeline failure, incl. the Chinese
  *                                        OOM guardrails thrown by decode/mesh
  *
@@ -52,8 +54,9 @@ export type MeshResponse =
       /** Coarse LOD mesh for distance switching; null when not built (small
        * meshes, or degraded — there `mesh` already is the coarse one). */
       coarse: MeshData | null
-      /** True when the full mesh hit the quad budget and the coarse mesh
-       * replaced it. */
+      /** True when `mesh` is a fallback approximation — the box-proxy tier
+       * (textured whole-block approximation, `coarse` still built) or the
+       * coarse mesh replacing the render entirely. */
       degraded: boolean
       /** User-facing notice shown with a degraded render; null otherwise. */
       notice: string | null
@@ -68,8 +71,13 @@ export interface MeshResult {
   notice: string | null
 }
 
-/** Notice text for a budget-degraded render. */
+/** Notice text for a budget-degraded coarse render. */
 export const LOD_NOTICE = '原理图过大,已自动降低精度显示'
+
+/** Notice for the box-proxy tier: the full-detail mesh overran the quad
+ * budget and non-cube states (stairs, walls, panes) render as textured
+ * whole blocks — merged and textured, only true shape is approximated. */
+export const BOX_NOTICE = '原理图较大,部分方块以简化整块渲染'
 
 /** Above this full-precision face count the coarse LOD mesh is also built
  * for distance switching. */
@@ -162,9 +170,10 @@ function isMeshData(value: unknown): value is MeshData {
 
 /** Every mesh attribute buffer — the transfer list for the done message,
  * moving all vertex data to the main thread without a copy. `coarse`, when
- * a separate LOD mesh was built, appends its buffers (the degraded case
- * passes none: `mesh` already is the coarse mesh, and an ArrayBuffer may
- * appear in a transfer list only once). */
+ * a separate LOD mesh was built, appends its buffers (the coarse-degraded
+ * case passes none: `mesh` already is the coarse mesh, and an ArrayBuffer
+ * may appear in a transfer list only once; the box-proxy tier transfers
+ * both). */
 export function meshTransferList(mesh: MeshData, coarse: MeshData | null = null): ArrayBuffer[] {
   const list: ArrayBuffer[] = [
     mesh.positions.buffer,
@@ -207,33 +216,51 @@ export function runMeshPipeline(
   }
   const assets = bundle ? surfaceAssetsFromBundle(bundle) : null
 
-  // Full-precision mesh; the quad-budget guardrail degrades to the coarse
-  // LOD mesh below instead of failing the render (decode-side errors —
-  // including its own volume guard — still propagate: without a decoded
-  // grid there is nothing to downsample).
+  // Full-precision mesh; the quad-budget guardrail degrades in two steps —
+  // first to the box-proxy tier (non-cube states as textured whole blocks,
+  // still merged and tinted), and only past that budget too to the coarse
+  // LOD mesh — instead of failing the render (decode-side errors, including
+  // its own volume guard, still propagate: without a decoded grid there is
+  // nothing to downsample).
   let full: MeshData | null = null
+  let boxTier = false
   const meshLimits = limits?.maxQuads === undefined ? undefined : { maxQuads: limits.maxQuads }
+  const meshProgress = (f: number): void =>
+    onProgress?.(DECODE_WEIGHT + f * (COARSE_START - DECODE_WEIGHT))
   try {
-    full = extractSurface(
-      grid,
-      assets,
-      undefined,
-      (f) => onProgress?.(DECODE_WEIGHT + f * (COARSE_START - DECODE_WEIGHT)),
-      meshLimits,
-    )
+    full = extractSurface(grid, assets, undefined, meshProgress, meshLimits)
   } catch (e) {
     if (!(e instanceof MeshBudgetError)) throw e
+    // The flat fallback has no non-cube states to proxy — retrying it would
+    // rebuild the identical mesh just to hit the same budget.
+    if (assets !== null) {
+      boxTier = true
+      try {
+        full = extractSurface(grid, assets, undefined, meshProgress, {
+          ...meshLimits,
+          cubeProxy: true,
+        })
+      } catch (e2) {
+        if (!(e2 instanceof MeshBudgetError)) throw e2
+      }
+    }
   }
 
   // Small meshes render alone; large ones also get a coarse mesh for
   // distance switching, and a budget-degraded render IS the coarse mesh.
   if (full && full.faceCount <= (limits?.lodFaceCount ?? LOD_FACE_COUNT)) {
     onProgress?.(1)
-    return { mesh: full, dims: grid.dims, coarse: null, degraded: false, notice: null }
+    return { mesh: full, dims: grid.dims, coarse: null, degraded: boxTier, notice: boxTier ? BOX_NOTICE : null }
   }
   const lod = buildLodMesh(grid, (f) => onProgress?.(COARSE_START + f * (1 - COARSE_START)))
   return full
-    ? { mesh: full, dims: grid.dims, coarse: lod.mesh, degraded: false, notice: null }
+    ? {
+        mesh: full,
+        dims: grid.dims,
+        coarse: lod.mesh,
+        degraded: boxTier,
+        notice: boxTier ? BOX_NOTICE : null,
+      }
     : { mesh: lod.mesh, dims: grid.dims, coarse: null, degraded: true, notice: LOD_NOTICE }
 }
 

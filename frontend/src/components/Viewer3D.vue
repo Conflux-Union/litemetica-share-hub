@@ -188,8 +188,9 @@ async function renderCurrent(stale: () => boolean): Promise<void> {
   // 3. Decode + mesh off the main thread (inline fallback on worker
   //    failure); vanilla model quads with cull groups, AO and tint baked
   //    into vertex colors; opaque / cutout / translucent / flat ranges.
-  //    `coarse` is the distance-LOD mesh; `degraded` means the quad budget
-  //    was hit and `mesh` already is the coarse one.
+  //    `coarse` is the distance-LOD mesh; `degraded` means a budget
+  //    fallback — the box-proxy tier (textured whole-block approximation)
+  //    or the coarse mesh replacing the render.
   const { mesh, dims, coarse, degraded, notice: pipelineNotice } = await meshWithFallback(
     gz,
     store?.bundle ?? null,

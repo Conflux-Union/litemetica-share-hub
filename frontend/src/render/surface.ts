@@ -133,11 +133,18 @@ export class MeshBudgetError extends Error {
   }
 }
 
-/** Budget overrides for {@link extractSurface}; tests stub a small
- * `maxQuads` to exercise the guardrail without a multi-million-quad
- * fixture. */
+/** Budget overrides and tier switches for {@link extractSurface}; tests stub
+ * a small `maxQuads` to exercise the guardrail without a multi-million-quad
+ * fixture, and `cubeProxy` to exercise the box-approximation tier. */
 export interface MeshLimits {
   maxQuads?: number
+  /** Box-proxy tier: non-cube states (stairs, walls, panes, …) mesh as full
+   * cubes wearing the state's first resolvable texture, making them
+   * greedy-mergeable and turning them into occluders. The pipeline
+   * (render/meshWorker) retries with this after the full-detail mesh
+   * overruns the budget — a textured whole-block approximation, unlike the
+   * flat coarse LOD. */
+  cubeProxy?: boolean
 }
 
 /** AO brightness by occluder count (side1&&side2 counts as 3); research §3
@@ -500,6 +507,20 @@ export function extractSurface(
     return { id: nsTile ? namespaced : textureId, tile: nsTile }
   }
 
+  /** Cube quads for a non-cube state in the box-proxy tier: the state's
+   * first atlas-resolvable texture on a canonical cube. Whole-model views
+   * are visually near-identical (stairs/walls/panes read as solid blocks at
+   * distance); the loss of true shape up close is the tier's documented
+   * approximation. Null when no quad resolves to a tile — the state then
+   * keeps the exact template path. */
+  const proxyCubeQuads = (quads: Quad[]): Quad[] | null => {
+    for (const q of quads) {
+      const { id, tile } = resolveTexture(q.texture)
+      if (tile) return cubeTemplate(id, q.tintindex)
+    }
+    return null
+  }
+
   /** Material interning: one small integer per distinct face appearance
    * (atlas tile + tint + alpha segment, or the fallback block color), so
    * the greedy scans can merge on `materialId << 8 | aoTuple` and states
@@ -584,8 +605,13 @@ export function extractSurface(
     const waterlogged = state.props.waterlogged === 'true'
     if (geo.missing) warnPlaceholder(geo.stateKey)
 
-    const mergeable = !geo.missing && mergeableCube(geo.quads)
-    const block = mergeable ? buildFaces(geo.quads, state, () => null, true) : null
+    const canonical = !geo.missing && mergeableCube(geo.quads)
+    const proxy =
+      !canonical && !geo.missing && limits?.cubeProxy === true
+        ? proxyCubeQuads(geo.quads)
+        : null
+    const mergeable = canonical || proxy !== null
+    const block = mergeable ? buildFaces(proxy ?? geo.quads, state, () => null, true) : null
     // Water cubes carry tintindex 0 → the constant water blue; a missing
     // water texture degrades silently to the flat water tint, not magenta.
     const water =
@@ -600,9 +626,10 @@ export function extractSurface(
       waterFaces: water?.faces ?? null,
       waterMergeIds: water?.mergeIds ?? null,
       // Glass/ice/… keep their faces against non-group neighbors, so only
-      // cull-group-free full cubes hide neighboring faces.
-      occludesFaces: geo.fullCube && group === undefined,
-      occludesAo: geo.fullCube,
+      // cull-group-free full cubes hide neighboring faces. In the box-proxy
+      // tier every non-air state is a cube, so proxies occlude like one.
+      occludesFaces: (geo.fullCube || proxy !== null) && group === undefined,
+      occludesAo: geo.fullCube || proxy !== null,
       group,
       hasWater: isWater || waterlogged,
       name: state.name,
