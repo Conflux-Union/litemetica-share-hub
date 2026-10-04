@@ -339,6 +339,13 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
 // layouts are stable across versions and were verified against the actual
 // jar textures (lid 14x5x14 @ texOffs(0,0), base 14x10x14 @ (0,19), latch
 // 2x4x1 @ (0,0); double-chest halves are 15 wide).
+//
+// Chest boxes are UV-inverted relative to generic entity boxes (skins put
+// the up face in the first top-row slot — Steve's arm/hand squares prove
+// that convention). In chest textures the first slot (u+d, v) holds the
+// interior view and the second (u+d+w, v) the exterior surface: christmas.png
+// has the ribbon cross only in the second slot, and the wiki's chest render
+// shows a planks top. chest_part_element therefore swaps up/down.
 
 /// Entity-texture stem (under assets/minecraft/textures/entity/chest/) for
 /// each chest-family blockstate. Waxed variants share the plain textures;
@@ -379,9 +386,16 @@ fn box_face_rects(w: u32, h: u32, d: u32, u: u32, v: u32) -> [Rect; 6] {
 }
 
 /// Crop one face region into its own transparent-padded 16x16 atlas tile.
-fn crop_tile(src: &image::RgbaImage, r: Rect) -> image::RgbaImage {
+/// `flip` mirrors the tile east-west: entity boxes run side-face u from
+/// west to east while block models run it east to west, so double-chest
+/// halves (whose seam-side edges are borderless for seamless joins) need
+/// flipped crops on exactly those faces — see chest_part_element.
+fn crop_tile(src: &image::RgbaImage, r: Rect, flip: bool) -> image::RgbaImage {
     let mut tile = image::RgbaImage::new(TILE, TILE);
-    let region = image::imageops::crop_imm(src, r.x, r.y, r.w, r.h).to_image();
+    let mut region = image::imageops::crop_imm(src, r.x, r.y, r.w, r.h).to_image();
+    if flip {
+        region = image::imageops::flip_horizontal(&region);
+    }
     image::imageops::overlay(&mut tile, &region, 0, 0);
     tile
 }
@@ -391,7 +405,9 @@ const CHEST_EPS: f64 = 0.002;
 /// One chest body part (base or lid) as a model element. Each face samples
 /// its own derived tile, so the uv is simply the region size. `prefix` names
 /// the part (e.g. "base"); `w`/`h`/`d` are the entity box dims at texOffs
-/// (u, v). Lateral (west/east) faces use the depth-sized rects.
+/// (u, v). Lateral (west/east) faces use the depth-sized rects. `mirror`
+/// flips the north/south tiles east-west for double-chest halves, where the
+/// entity-vs-block side-face u direction differs (see crop_tile).
 fn chest_part_element(
     src: &image::RgbaImage,
     derived_tiles: &mut HashMap<String, image::RgbaImage>,
@@ -404,8 +420,13 @@ fn chest_part_element(
     d: u32,
     u: u32,
     v: u32,
+    mirror: bool,
 ) -> (Value, Map<String, Value>) {
-    let rects = box_face_rects(w, h, d, u, v);
+    let mut rects = box_face_rects(w, h, d, u, v);
+    // Chest textures draw the interior view in the generic up slot and the
+    // exterior surface in the generic down slot (see the module note above),
+    // so the closed chest's visible top face must sample the second rect.
+    rects.swap(0, 1);
     let dirs = ["up", "down", "north", "south", "west", "east"];
     let mut faces = Map::new();
     let mut textures = Map::new();
@@ -413,7 +434,13 @@ fn chest_part_element(
         let r = rects[i];
         let key = format!("{part}_{dir}");
         let tile_id = format!("{tile_prefix}__{key}");
-        derived_tiles.entry(tile_id.clone()).or_insert_with(|| crop_tile(src, r));
+        // Only the north/south faces mirror: entity boxes run side-face u
+        // from west to east while block models run it east to west (up/down
+        // faces agree), so a flipped crop is needed exactly there.
+        let flip = mirror && matches!(*dir, "north" | "south");
+        derived_tiles
+            .entry(tile_id.clone())
+            .or_insert_with(|| crop_tile(src, r, flip));
         textures.insert(key.clone(), json!(tile_id));
         faces.insert(
             dir.to_string(),
@@ -425,7 +452,8 @@ fn chest_part_element(
 
 /// A full chest model for one texture stem. `x0`/`x1` place the base box in
 /// the block (14 wide for singles, 15 wide flush to one side for halves);
-/// `halves` selects the double-chest box dims and omits the latch.
+/// `half` selects the double-chest box dims, mirrors the part east-west so
+/// half textures' borderless seam edges join, and hugs the latch to the seam.
 fn chest_model_json(
     src: &image::RgbaImage,
     derived_tiles: &mut HashMap<String, image::RgbaImage>,
@@ -434,49 +462,69 @@ fn chest_model_json(
     x1: f64,
     half: bool,
 ) -> Value {
-    let (bw, latch) = if half { (15u32, false) } else { (14u32, true) };
+    let bw = if half { 15u32 } else { 14u32 };
     let (base, base_tex) = chest_part_element(
         src, derived_tiles, tile_prefix, "base",
         [x0, 0.0, 1.0], [x1, 10.0, 15.0],
-        bw, 10, 14, 0, 19,
+        bw, 10, 14, 0, 19, half,
     );
+    // The lid insets to avoid z-fighting the base's coplanar side walls,
+    // but a half keeps its seam edge flush: an inset there opens a hairline
+    // slit between the pair's lids (a black line on the top and sides). The
+    // seam-side faces end up coplanar and opposite-facing, so they never
+    // z-fight, and the neighbor's box occludes them. Halves are placed by
+    // x0: right hugs the west edge (seam at x0), left the east edge (x1).
+    let (lid_x0, lid_x1) = if half {
+        if x0 == 0.0 { (x0, x1 - CHEST_EPS) } else { (x0 + CHEST_EPS, x1) }
+    } else {
+        (x0 + CHEST_EPS, x1 - CHEST_EPS)
+    };
     let (lid, lid_tex) = chest_part_element(
         src, derived_tiles, tile_prefix, "lid",
-        [x0 + CHEST_EPS, 9.0, 1.0 + CHEST_EPS], [x1 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS],
-        bw, 5, 14, 0, 0,
+        [lid_x0, 9.0, 1.0 + CHEST_EPS], [lid_x1, 14.0, 15.0 - CHEST_EPS],
+        bw, 5, 14, 0, 0, half,
     );
     let mut elements = vec![base, lid];
     let mut textures = base_tex;
     for (k, v) in lid_tex {
         textures.insert(k, v);
     }
-    if latch {
-        // The latch samples sub-rects of one 6x5 tile cropped from the
-        // texture's top-left corner (the region vanilla's lock box uses).
-        let latch_tile = format!("{tile_prefix}__latch");
-        derived_tiles
-            .entry(latch_tile.clone())
-            .or_insert_with(|| crop_tile(src, Rect { x: 0, y: 0, w: 6, h: 5 }));
-        textures.insert("latch".into(), json!(latch_tile));
-        let rects = box_face_rects(2, 4, 1, 0, 0);
-        let dirs = ["up", "down", "north", "south", "west", "east"];
-        let mut faces = Map::new();
-        for (i, dir) in dirs.iter().enumerate() {
-            let r = rects[i];
-            faces.insert(
-                dir.to_string(),
-                json!({
-                    "texture": "#latch",
-                    "uv": [r.x, r.y, r.x + r.w, r.y + r.h],
-                }),
-            );
-        }
-        elements.push(json!({
-            "from": [7.0, 7.0, 0.0],
-            "to": [9.0, 11.0, 1.0],
-            "faces": faces,
-        }));
+    // Latch: singles center a 2x4x1 box on the front. Halves place a 1x4x1
+    // latch against the seam edge — vanilla's large chest joins the two
+    // pieces into one 2-wide lock. The half textures draw their latch art
+    // at different texOffs, and the type↔texture cross-mapping puts the
+    // right-half file (art at (0,0)) on the left type and the left-half
+    // file (art at (1,0)) on the right type; each piece's seam-side face
+    // samples a transparent column hidden against the neighbor's latch.
+    let (latch_x, latch_w, latch_u) = if half {
+        if x0 == 0.0 { ((0.0, 1.0), 1u32, 1u32) } else { ((15.0, 16.0), 1u32, 0u32) }
+    } else {
+        ((7.0, 9.0), 2u32, 0u32)
+    };
+    let latch_tile = format!("{tile_prefix}__latch");
+    let latch_region = Rect { x: latch_u, y: 0, w: 4 + latch_w, h: 5 };
+    derived_tiles
+        .entry(latch_tile.clone())
+        .or_insert_with(|| crop_tile(src, latch_region, false));
+    textures.insert("latch".into(), json!(latch_tile));
+    let rects = box_face_rects(latch_w, 4, 1, latch_u, 0);
+    let dirs = ["up", "down", "north", "south", "west", "east"];
+    let mut faces = Map::new();
+    for (i, dir) in dirs.iter().enumerate() {
+        let r = rects[i];
+        faces.insert(
+            dir.to_string(),
+            json!({
+                "texture": "#latch",
+                "uv": [r.x - latch_u, r.y, r.x - latch_u + r.w, r.y + r.h],
+            }),
+        );
     }
+    elements.push(json!({
+        "from": [latch_x.0, 7.0, 0.0],
+        "to": [latch_x.1, 11.0, 1.0],
+        "faces": faces,
+    }));
     textures.insert("particle".into(), json!("#base_up"));
     json!({ "textures": textures, "elements": elements })
 }
@@ -520,11 +568,14 @@ fn synthesize_chests(
         // Double-chest halves are flush against the block-boundary seam
         // (left half hugs the east edge of its block, right half the west
         // edge) so an adjacent left+right pair reads as one continuous box.
+        // A type=left chest renders the *_right art: vanilla names the half
+        // textures from the chest's own perspective, so they cross-map to
+        // the type property (verified against in-game appearance).
         let mut variants = Map::new();
         variants.insert("".into(), json!({ "model": single_model }));
         let halves = [
-            ("left", (stem.to_string() + "_left", 1.0)),
-            ("right", (stem.to_string() + "_right", 0.0)),
+            ("left", (stem.to_string() + "_right", 1.0)),
+            ("right", (stem.to_string() + "_left", 0.0)),
         ]
         .into_iter()
         .filter_map(|(ty, (tex_stem, x0))| {
@@ -993,18 +1044,48 @@ mod tests {
         assert_eq!(latch["to"], json!([9.0, 11.0, 1.0]));
         assert_eq!(latch["faces"]["north"]["uv"], json!([1, 1, 3, 5]));
 
-        // Every face tile cropped its region: the base-up tile's first pixel
-        // equals the source pixel at the region origin (14, 19).
+        // Every face tile cropped its region. Chest up/down slots are
+        // inverted vs the generic box layout (see chest_part_element), so
+        // base_up samples the second top-row square (28, 19) and lid_up the
+        // exterior-top square (28, 0) — the planks/ribbon region in real
+        // chest textures, not the interior view at (14, 0).
         let up = &tiles["minecraft:entity/chest/test__base_up"];
-        assert_eq!(up.get_pixel(0, 0), src.get_pixel(14, 19));
+        assert_eq!(up.get_pixel(0, 0), src.get_pixel(28, 19));
+        let lid_up = &tiles["minecraft:entity/chest/test__lid_up"];
+        assert_eq!(lid_up.get_pixel(0, 0), src.get_pixel(28, 0));
+        let lid_down = &tiles["minecraft:entity/chest/test__lid_down"];
+        assert_eq!(lid_down.get_pixel(0, 0), src.get_pixel(14, 0));
         let north = &tiles["minecraft:entity/chest/test__base_north"];
         assert_eq!(north.get_pixel(0, 0), src.get_pixel(14, 33));
-        // The half variant has no latch and is 15 wide.
+        // The half variant is 15 wide, keeps its seam edge flush, mirrors
+        // the north/south tiles (entity-vs-block side-face u direction),
+        // and hugs a 1-wide latch to the seam.
         let mut half_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
         let half = chest_model_json(&src, &mut half_tiles, "minecraft:entity/chest/test_h", 0.0, 15.0, true);
-        assert_eq!(half["elements"].as_array().unwrap().len(), 2);
+        assert_eq!(half["elements"].as_array().unwrap().len(), 3);
         assert_eq!(half["elements"][0]["from"], json!([0.0, 0.0, 1.0]));
-        assert!(half["textures"].get("latch").is_none());
+        // Right half hugs the west edge (seam at x0): lid starts flush there.
+        assert_eq!(half["elements"][1]["from"], json!([0.0, 9.0, 1.0 + CHEST_EPS]));
+        assert_eq!(half["elements"][1]["to"], json!([15.0 - CHEST_EPS, 14.0, 15.0 - CHEST_EPS]));
+        // Latch hugs the same seam edge; its texOffs is (1,0) for right halves.
+        assert_eq!(half["elements"][2]["from"], json!([0.0, 7.0, 0.0]));
+        assert_eq!(half["elements"][2]["to"], json!([1.0, 11.0, 1.0]));
+        assert_eq!(half["elements"][2]["faces"]["north"]["uv"], json!([1, 1, 2, 5]));
+        // North/south tiles flip; up/down and laterals do not.
+        let h_up = &half_tiles["minecraft:entity/chest/test_h__lid_up"];
+        assert_eq!(h_up.get_pixel(0, 0), src.get_pixel(29, 0));
+        assert_eq!(h_up.get_pixel(14, 0), src.get_pixel(43, 0));
+        let h_north = &half_tiles["minecraft:entity/chest/test_h__base_north"];
+        assert_eq!(h_north.get_pixel(0, 0), src.get_pixel(28, 33));
+        let h_west = &half_tiles["minecraft:entity/chest/test_h__base_west"];
+        assert_eq!(h_west.get_pixel(0, 0), src.get_pixel(0, 33));
+        // The left half hugs the east edge: seam flush at x1, latch at (0,0).
+        let mut left_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
+        let left = chest_model_json(&src, &mut left_tiles, "minecraft:entity/chest/test_l", 1.0, 16.0, true);
+        assert_eq!(left["elements"][1]["from"], json!([1.0 + CHEST_EPS, 9.0, 1.0 + CHEST_EPS]));
+        assert_eq!(left["elements"][1]["to"], json!([16.0, 14.0, 15.0 - CHEST_EPS]));
+        assert_eq!(left["elements"][2]["from"], json!([15.0, 7.0, 0.0]));
+        assert_eq!(left["elements"][2]["faces"]["north"]["uv"], json!([1, 1, 2, 5]));
     }
 
     #[test]
