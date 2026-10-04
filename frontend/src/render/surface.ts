@@ -2,13 +2,24 @@
  * Neighbor-aware surface mesher (plan §5 P2.4) with greedy face merging.
  *
  * Mergeable states — vanilla full-cube models, the synthesized water cube
- * and the no-bundle fallback — are meshed by six directional mask scans:
- * visible faces of one palette entry whose outside cell has no AO occluder
- * in its 3x3 neighborhood merge into maximal rectangles (one quad per run;
- * tint and face shade are uniform because the palette entry is uniform),
- * while AO-shadowed faces fall back to the per-face path (vertex AO +
- * diagonal flip) inside the same scan. Every face is emitted exactly once;
- * the scans never re-emit what the template path draws.
+ * and the no-bundle fallback — are meshed by six directional mask scans.
+ * The merge key is the face's *material* (atlas tile + tint + alpha segment,
+ * or the fallback block color) packed with its corner-AO tuple: runs of one
+ * material whose corner AO matches merge into maximal rectangles that
+ * reproduce the unmerged per-vertex shading exactly, so different palette
+ * states that render identically (stair facings, water levels) merge too.
+ * Every face is emitted exactly once; the scans never re-emit what the
+ * template path draws.
+ *
+ * Giant grids (more than `COARSE_MERGE_MAX_OCCLUDERS` occluding voxels —
+ * bridge-scale captures with rough natural terrain) cannot afford per-vertex
+ * AO shading: exact AO tuples keep ~1×1 quads on noisy surfaces and the
+ * vertex buffers alone would exhaust a browser tab. Past the cap the mesher
+ * drops baked AO, and in the no-bundle fallback it also merges runs by
+ * geometry alone, coloring each merged rectangle from its corner cells'
+ * block colors — locally averaged shading instead of per-block boundaries.
+ * Smaller grids keep full detail; the synthetic stress fixture stays under
+ * the cap on purpose.
  *
  * Everything else — stairs, walls, panes, torches, cross plants, magenta
  * placeholders — keeps the per-voxel template path: cached per-state quad
@@ -105,6 +116,29 @@ const WATER_NAMES = new Set(['minecraft:water', 'minecraft:flowing_water'])
 
 const AIR_NAMES = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:void_air'])
 
+/** True when a palette entry is one of the three vanilla airs (property
+ * suffix stripped); the coarse downsampler (render/lod) shares this. */
+export function isAirState(stateKey: string): boolean {
+  return AIR_NAMES.has(parseState(stateKey).name)
+}
+
+/** Quad-budget guardrail thrown by {@link extractSurface} when a mesh would
+ * exceed the cap. The pipeline (render/meshWorker) catches exactly this and
+ * degrades to the coarse LOD mesh instead of failing the render; the
+ * Chinese message is the user-facing text either way. */
+export class MeshBudgetError extends Error {
+  constructor() {
+    super('原理图过大,无法在浏览器中生成预览')
+    this.name = 'MeshBudgetError'
+  }
+}
+
+/** Budget overrides for {@link extractSurface}; tests stub a small
+ * `maxQuads` to exercise the guardrail without a 16M-quad fixture. */
+export interface MeshLimits {
+  maxQuads?: number
+}
+
 /** AO brightness by occluder count (side1&&side2 counts as 3); research §3
  * strength table [1, 0.7, 0.5, 0.2]. */
 const AO_STRENGTH = [1, 0.7, 0.5, 0.2] as const
@@ -113,12 +147,21 @@ const AO_STRENGTH = [1, 0.7, 0.5, 0.2] as const
  * exhaust a browser tab (decode.ts guards the voxel count upstream). */
 const MAX_QUADS = 16_000_000
 
+/** Above this many AO-occluding voxels the mesher stops baking per-vertex
+ * AO (and, in the flat-color fallback, merges runs by geometry with corner
+ * cell colors): exact AO tuples keep terrain at ~1 quad per face, which at
+ * this scale overflows browser memory. The synthetic stress fixture
+ * (566x256x1423 deck + pillars) sits at ~2.3M occluders and stays in exact
+ * mode; real bridge captures with rough terrain land well above the cap. */
+const COARSE_MERGE_MAX_OCCLUDERS = 3_000_000
+
 const WHITE: Rgb = [1, 1, 1]
 const MAGENTA: Rgb = [1, 0, 1]
 
 /** Directional shade per face, by dominant normal axis (up 1.0, down 0.5,
- * ±z 0.86, ±x 0.72 — same table the previous mesher baked). */
-function faceLight(normal: readonly number[]): number {
+ * ±z 0.86, ±x 0.72 — same table the previous mesher baked). Exported for
+ * the coarse LOD mesher, which bakes the same shading. */
+export function faceLight(normal: readonly number[]): number {
   const ax = Math.abs(normal[0])
   const ay = Math.abs(normal[1])
   const az = Math.abs(normal[2])
@@ -139,7 +182,11 @@ interface CubeFace {
   uvs: [number, number][]
 }
 
-const CUBE_FACES: CubeFace[] = [
+/** Shared cube topology: corner winding and per-corner uv anchors of the
+ * six full-cube faces. Exported so the coarse LOD mesher (render/lod)
+ * emits provably same-source normals/winding — backface culling stays
+ * consistent between the two levels. */
+export const CUBE_FACES: CubeFace[] = [
   {
     dir: 'up',
     corners: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
@@ -185,7 +232,9 @@ interface ScanAxes {
   v: 0 | 1 | 2
 }
 
-const DIR_SCAN: ScanAxes[] = [
+/** Exported with CUBE_FACES: which axis each direction's greedy scan slides
+ * (d) and runs along (u row, v column) — see render/lod. */
+export const DIR_SCAN: ScanAxes[] = [
   { d: 1, u: 0, v: 2 }, // up: plane (x, z)
   { d: 1, u: 0, v: 2 }, // down
   { d: 2, u: 0, v: 1 }, // north: plane (x, y)
@@ -203,6 +252,12 @@ const SCAN_T1: readonly [number, number, number][] = DIR_SCAN.map((s) =>
 const SCAN_T2: readonly [number, number, number][] = DIR_SCAN.map((s) =>
   s.d === 2 ? [0, 1, 0] : [0, 0, 1],
 )
+
+/** Axis index of each SCAN_T1 / SCAN_T2 tangent (0=x, 1=y, 2=z). Note the
+ * tangents do not always align with the scan's u/v axes: west/east scans
+ * run u=z, v=y while their AO tangents are t1=y, t2=z. */
+const T1_AXIS = SCAN_T1.map((t) => (t[0] !== 0 ? 0 : t[1] !== 0 ? 1 : 2))
+const T2_AXIS = SCAN_T2.map((t) => (t[0] !== 0 ? 0 : t[1] !== 0 ? 1 : 2))
 
 /** Full-cube quad template with a cullface per direction. */
 function cubeTemplate(texture: string, tintindex?: number): Quad[] {
@@ -227,10 +282,9 @@ const FALLBACK_QUADS = cubeTemplate('')
 // Per-palette-entry classification
 // ---------------------------------------------------------------------------
 
-/** One mergeable cube face, resolved once per palette entry: the template
- * quad for per-face (AO-shadowed) emission plus its baked material info. */
+/** One mergeable cube face, resolved once per palette entry: its baked
+ * material info (the merged path rebuilds geometry from CUBE_FACES). */
 interface FaceInfo {
-  quad: Quad
   tint: Rgb | null
   tile: TileTransform | null
   segment: SegmentName
@@ -246,9 +300,14 @@ interface VoxelTemplate {
   /** Greedy-mergeable block faces per CUBE_FACES direction; null when the
    * model is not a plain full cube (stairs, panes, plants, …). */
   faces: FaceInfo[] | null
+  /** Material id per CUBE_FACES direction (see `internMaterial`); faces of
+   * different palette entries that render identically share an id and merge. */
+  mergeIds: Int32Array
   /** Synthesized water cube (water block or waterlogged state), always
    * greedy-mergeable; null without water. */
   waterFaces: FaceInfo[] | null
+  /** Material ids of the synthesized water faces; null without water. */
+  waterMergeIds: Int32Array | null
   /** Hides neighbors' culled faces: full-cube shape outside cull groups. */
   occludesFaces: boolean
   /** Darkens neighbor vertices via AO: full-cube shape. */
@@ -374,7 +433,10 @@ function segmentOfAlpha(alpha: AlphaClass): SegmentName {
  * Extract the visible surface of the voxel grid as one indexed mesh with
  * per-alpha-class draw ranges. `store === null` keeps the flat-color
  * fallback (full cubes tinted with block colors). `cache` overrides the
- * shared state-geometry cache (tests pass isolated maps).
+ * shared state-geometry cache (tests pass isolated maps). `limits`
+ * overrides the quad budget (tests stub a small one; exceeding it throws
+ * {@link MeshBudgetError}, which the pipeline turns into coarse-LOD
+ * degradation instead of a failed render).
  *
  * `onProgress`, when given, receives a 0..1 fraction: once after the
  * per-palette template build, then per swept slice of the six greedy
@@ -386,6 +448,7 @@ export function extractSurface(
   store: SurfaceAssets | null,
   cache: Map<string, StateGeometry> = stateGeometryCache,
   onProgress?: (fraction: number) => void,
+  limits?: MeshLimits,
 ): MeshData {
   const [dx, dy, dz] = grid.dims
   const dims = [dx, dy, dz] as const
@@ -407,6 +470,31 @@ export function extractSurface(
     return { id: nsTile ? namespaced : textureId, tile: nsTile }
   }
 
+  /** Material interning: one small integer per distinct face appearance
+   * (atlas tile + tint + alpha segment, or the fallback block color), so
+   * the greedy scans can merge on `materialId << 8 | aoTuple` and states
+   * that render identically collapse into shared runs. `flatColors` keeps
+   * the packed 24-bit rgb per untextured material for coarse-merge corner
+   * colors. Id 0 is reserved so keys of real faces are never 0. */
+  const materialIds = new Map<string, number>()
+  const flatColors: number[] = [0]
+  const internMaterial = (face: FaceInfo, textureId: string): number => {
+    const key = face.tile
+      ? `${textureId}|${face.tile.u0},${face.tile.v0}|${face.tint ?? ''}|${face.segment}`
+      : `flat|${face.flat?.join(',') ?? ''}|${face.segment}`
+    let id = materialIds.get(key)
+    if (id === undefined) {
+      id = materialIds.size + 1
+      materialIds.set(key, id)
+      flatColors[id] = face.flat
+        ? (Math.round(face.flat[0] * 255) << 16) |
+          (Math.round(face.flat[1] * 255) << 8) |
+          Math.round(face.flat[2] * 255)
+        : 0
+    }
+    return id
+  }
+
   /** Per-direction face infos for a six-quad cube template (indexed by
    * CUBE_FACES position via each quad's cullface). */
   const buildFaces = (
@@ -414,21 +502,24 @@ export function extractSurface(
     state: BlockState,
     flatOf: (tint: Rgb | null) => Rgb | null,
     warnMissing: boolean,
-  ): FaceInfo[] => {
+  ): { faces: FaceInfo[]; mergeIds: Int32Array } => {
     const faces: FaceInfo[] = new Array(6)
+    const mergeIds = new Int32Array(6)
     for (const q of quads) {
       const tint = resolveTint(state.name, state.props, q.tintindex)
       const { id, tile } = resolveTexture(q.texture)
       if (!tile && warnMissing) warnTexture(q.texture)
-      faces[DIR_INDEX[q.cullface!]] = {
-        quad: q,
+      const face: FaceInfo = {
         tint,
         tile,
         segment: tile ? segmentOfAlpha(store?.alphaClass(id) ?? 'opaque') : 'flat',
         flat: flatOf(tint),
       }
+      const slot = DIR_INDEX[q.cullface!]
+      faces[slot] = face
+      mergeIds[slot] = internMaterial(face, id)
     }
-    return faces
+    return { faces, mergeIds }
   }
 
   // One template per palette entry; air variants mesh as empty.
@@ -438,17 +529,14 @@ export function extractSurface(
     if (!store) {
       // No bundle: flat-colored full cubes (blockColor strips state strings).
       const color = blockColor(stateKey)
+      const { faces, mergeIds } = buildFaces(FALLBACK_QUADS, parseState(stateKey), () => color, false)
       return {
         placeholder: false,
         quads: [],
-        faces: FALLBACK_QUADS.map((q) => ({
-          quad: q,
-          tint: null,
-          tile: null,
-          segment: 'flat',
-          flat: color,
-        })),
+        faces,
+        mergeIds,
         waterFaces: null,
+        waterMergeIds: null,
         occludesFaces: true,
         occludesAo: true,
         group: undefined,
@@ -467,16 +555,20 @@ export function extractSurface(
     if (geo.missing) warnPlaceholder(geo.stateKey)
 
     const mergeable = !geo.missing && mergeableCube(geo.quads)
+    const block = mergeable ? buildFaces(geo.quads, state, () => null, true) : null
+    // Water cubes carry tintindex 0 → the constant water blue; a missing
+    // water texture degrades silently to the flat water tint, not magenta.
+    const water =
+      isWater || waterlogged
+        ? buildFaces(WATER_QUADS, state, (tint) => tint ?? MAGENTA, false)
+        : null
     return {
       placeholder: geo.missing,
       quads: geo.missing || mergeable ? [] : geo.quads,
-      faces: mergeable ? buildFaces(geo.quads, state, () => null, true) : null,
-      // Water cubes carry tintindex 0 → the constant water blue; a missing
-      // water texture degrades silently to the flat water tint, not magenta.
-      waterFaces:
-        isWater || waterlogged
-          ? buildFaces(WATER_QUADS, state, (tint) => tint ?? MAGENTA, false)
-          : null,
+      faces: block?.faces ?? null,
+      mergeIds: block?.mergeIds ?? new Int32Array(6),
+      waterFaces: water?.faces ?? null,
+      waterMergeIds: water?.mergeIds ?? null,
       // Glass/ice/… keep their faces against non-group neighbors, so only
       // cull-group-free full cubes hide neighboring faces.
       occludesFaces: geo.fullCube && group === undefined,
@@ -488,6 +580,20 @@ export function extractSurface(
       color: [1, 1, 1],
     }
   })
+
+  // Coarse-merge gate: one LUT pass counts AO-occluding voxels (skipped
+  // entirely for grids that could not reach the cap). Past the cap the
+  // mesher drops baked AO everywhere, and the flat-color fallback also
+  // merges runs by geometry alone with corner-cell colors.
+  let aoDetail = true
+  if (grid.data.length > COARSE_MERGE_MAX_OCCLUDERS) {
+    const occluderLut = new Uint8Array(templates.length)
+    for (let i = 0; i < templates.length; i++) occluderLut[i] = templates[i]?.occludesAo ? 1 : 0
+    let occluders = 0
+    for (let i = 0; i < grid.data.length; i++) occluders += occluderLut[grid.data[i]]
+    aoDetail = occluders <= COARSE_MERGE_MAX_OCCLUDERS
+  }
+  const coarseColors = !aoDetail && store === null
 
   // Progress phases: template build 0..2%, greedy scans 2..72%, template
   // pass 72..100%. Per-slice / per-y-layer granularity only.
@@ -527,16 +633,26 @@ export function extractSurface(
     return nb.occludesFaces || nb.hasWater
   }
 
-  /** A face may merge only when every corner AO is 1: no occludesAo voxel
-   * anywhere in the 3x3 neighborhood of the outside cell (water quads skip
-   * this check — water never receives AO). */
-  const faceAoClean = (x: number, y: number, z: number, dirIdx: number): boolean => {
+  /** Scratch 3x3 occluder ring around a face's outside cell, indexed
+   * `(du + 1) * 3 + dv + 1` with du along SCAN_T1 and dv along SCAN_T2. */
+  const aoRing = new Uint8Array(9)
+
+  /** Packed corner-AO tuple of one mergeable face at (x,y,z) toward
+   * CUBE_FACES[dirIdx].dir: the per-corner AO strength indices (the same
+   * values vertexAo computes for the template path) as 2 bits each in
+   * CUBE_FACES corner order. 0 means every corner fully lit. Faces merge
+   * only into runs of one material AND one tuple — the run then reproduces
+   * the unmerged per-corner shading exactly (water quads pass 0: water
+   * never receives AO). Returns 0 in coarse-merge mode (no baked AO). */
+  const cornerAo = (x: number, y: number, z: number, dirIdx: number): number => {
+    if (!aoDetail) return 0
     const n = FACE_NORMALS[CUBE_FACES[dirIdx].dir]
     const e1 = SCAN_T1[dirIdx]
     const e2 = SCAN_T2[dirIdx]
     const bx = x + n[0]
     const by = y + n[1]
     const bz = z + n[2]
+    aoRing.fill(0)
     for (let du = -1; du <= 1; du++) {
       for (let dv = -1; dv <= 1; dv++) {
         if (
@@ -546,16 +662,34 @@ export function extractSurface(
             bz + du * e1[2] + dv * e2[2],
           )
         ) {
-          return false
+          aoRing[(du + 1) * 3 + dv + 1] = 1
         }
       }
     }
-    return true
+    // Corner sign follows the corner position relative to the block center
+    // along each tangent axis — vertexAo's `p[t] > 0.5` convention.
+    const corners = CUBE_FACES[dirIdx].corners
+    const a1 = T1_AXIS[dirIdx]
+    const a2 = T2_AXIS[dirIdx]
+    let bits = 0
+    for (let i = 0; i < 4; i++) {
+      const c = corners[i]
+      const su = c[a1] > 0 ? 1 : -1
+      const sv = c[a2] > 0 ? 1 : -1
+      const s1 = aoRing[(su + 1) * 3 + 1] === 1
+      const s2 = aoRing[3 + (sv + 1)] === 1
+      const cr = aoRing[(su + 1) * 3 + (sv + 1)] === 1
+      const strength = s1 && s2 ? 3 : (s1 ? 1 : 0) + (s2 ? 1 : 0) + (cr ? 1 : 0)
+      bits |= strength << (6 - 2 * i)
+    }
+    return bits
   }
 
   /** Per-vertex AO from the full-cube neighbors around the face's outside
-   * cell; corner sign follows the vertex position relative to block center. */
+   * cell; corner sign follows the vertex position relative to block center.
+   * Fully lit in coarse-merge mode (AO is not baked at that scale). */
   const vertexAo = (quad: Quad, wx: number, wy: number, wz: number): number[] => {
+    if (!aoDetail) return [1, 1, 1, 1]
     const nx = Math.abs(quad.normal[0])
     const ny = Math.abs(quad.normal[1])
     const nz = Math.abs(quad.normal[2])
@@ -589,8 +723,9 @@ export function extractSurface(
   }
 
   let quadBudget = 0
+  const quadCap = limits?.maxQuads ?? MAX_QUADS
   const spendQuad = (): void => {
-    if (++quadBudget > MAX_QUADS) throw new Error('原理图过大,无法在浏览器中生成预览')
+    if (++quadBudget > quadCap) throw new MeshBudgetError()
   }
 
   const pushQuad = (
@@ -664,24 +799,14 @@ export function extractSurface(
     }
   }
 
-  /** One AO-shadowed greedy cell: today's per-face emission, verbatim. */
-  const emitScanFace = (info: FaceInfo, x: number, y: number, z: number): void => {
-    pushQuad(
-      buckets[info.segment],
-      x,
-      y,
-      z,
-      info.quad,
-      info.tile,
-      info.tint,
-      vertexAo(info.quad, x, y, z),
-      info.flat,
-    )
-  }
-
   /** One merged rectangle: CUBE_FACES corner/uv topology with the in-plane
    * offsets and uv values scaled by w/h; constant normal, face light × tint
-   * (AO is 1 by the merge precondition). */
+   * × per-corner AO from the run's shared tuple (the exact shading the
+   * unmerged cells would show), with the quad diagonal flipped toward the
+   * brighter corner pair like the per-face path. `cornerFlat` (coarse
+   * fallback only) overrides the tint per corner with the packed 24-bit
+   * block colors of the rectangle's corner cells, so geometry-merged runs
+   * of mixed blocks shade as a local color average. */
   const emitMerged = (
     info: FaceInfo,
     dirIdx: number,
@@ -690,6 +815,8 @@ export function extractSurface(
     s: number,
     w: number,
     h: number,
+    aoBits: number,
+    cornerFlat: number[] | null,
   ): void => {
     spendQuad()
     const face = CUBE_FACES[dirIdx]
@@ -733,26 +860,50 @@ export function extractSurface(
         org.data[org.length++] = 0
         org.data[org.length++] = 0
       }
-      col.data[col.length++] = color[0] * light
-      col.data[col.length++] = color[1] * light
-      col.data[col.length++] = color[2] * light
+      const ao = AO_STRENGTH[(aoBits >> (6 - 2 * i)) & 3]
+      // Coarse fallback: the corner cell's own block color × face light.
+      const cr = cornerFlat ? (((cornerFlat[i] >> 16) & 0xff) / 255) * light * ao : color[0] * light * ao
+      const cg = cornerFlat ? (((cornerFlat[i] >> 8) & 0xff) / 255) * light * ao : color[1] * light * ao
+      const cb = cornerFlat ? ((cornerFlat[i] & 0xff) / 255) * light * ao : color[2] * light * ao
+      col.data[col.length++] = cr
+      col.data[col.length++] = cg
+      col.data[col.length++] = cb
     }
     const idx = bucket.indices
     idx.reserve(6)
-    idx.data[idx.length++] = base
-    idx.data[idx.length++] = base + 1
-    idx.data[idx.length++] = base + 2
-    idx.data[idx.length++] = base
-    idx.data[idx.length++] = base + 2
-    idx.data[idx.length++] = base + 3
+    // Flip the shared diagonal toward the brighter pair to hide AO seams.
+    if (
+      AO_STRENGTH[(aoBits >> 6) & 3] + AO_STRENGTH[(aoBits >> 2) & 3] <
+      AO_STRENGTH[(aoBits >> 4) & 3] + AO_STRENGTH[aoBits & 3]
+    ) {
+      idx.data[idx.length++] = base + 1
+      idx.data[idx.length++] = base + 2
+      idx.data[idx.length++] = base + 3
+      idx.data[idx.length++] = base + 1
+      idx.data[idx.length++] = base + 3
+      idx.data[idx.length++] = base
+    } else {
+      idx.data[idx.length++] = base
+      idx.data[idx.length++] = base + 1
+      idx.data[idx.length++] = base + 2
+      idx.data[idx.length++] = base
+      idx.data[idx.length++] = base + 2
+      idx.data[idx.length++] = base + 3
+    }
   }
 
   // -------------------------------------------------------------------------
-  // Greedy scans: six directions × (block pass + water pass). Positive mask
-  // values are mergeable palette indices, negatives mark AO-shadowed cells
-  // that emit immediately, 0 is nothing. Sweeps clear every non-zero cell,
-  // so the masks start zeroed for the next slice.
+  // Greedy scans: six directions × (block pass + water pass). Block mask
+  // values are merge keys `(materialId << 8) | aoTuple`, water mask values
+  // carry the water material; parallel `*Pi` masks keep the anchor cell's
+  // palette index for face-info lookup. 0 is nothing. In coarse fallback
+  // mode runs merge by geometry alone and take their colors from the corner
+  // cells' materials. Sweeps clear every non-zero cell, so the masks start
+  // zeroed for the next slice.
   // -------------------------------------------------------------------------
+
+  /** Scratch corner colors for one coarse-mode emission (packed 24-bit). */
+  const cornerColors = [0, 0, 0, 0]
 
   for (let dirIdx = 0; dirIdx < 6; dirIdx++) {
     const scan = DIR_SCAN[dirIdx]
@@ -767,11 +918,23 @@ export function extractSurface(
     const strideV = strideAxis[va]
     const strideD = strideAxis[da]
     const blockMask = new Int32Array(nu * nv)
+    const blockPi = new Int32Array(nu * nv)
     const waterMask = new Int32Array(nu * nv)
+    const waterPi = new Int32Array(nu * nv)
 
-    /** Standard maximal-rectangle sweep; AO-shadowed cells emit alone via
-     * the per-face path (vertex AO, diagonal flip). */
-    const sweep = (mask: Int32Array, water: boolean, s: number): void => {
+    // Merge-key LUTs for this direction (0 = not mergeable).
+    const keyLut = new Int32Array(templates.length)
+    const waterKeyLut = new Int32Array(templates.length)
+    for (let i = 0; i < templates.length; i++) {
+      const rec = templates[i]
+      if (!rec) continue
+      if (rec.faces) keyLut[i] = rec.mergeIds[dirIdx] << 8
+      if (rec.waterFaces && rec.waterMergeIds) waterKeyLut[i] = rec.waterMergeIds[dirIdx] << 8
+    }
+
+    /** Standard maximal-rectangle sweep over equal merge keys; the shared
+     * AO tuple drives per-corner shading and the diagonal flip. */
+    const sweep = (mask: Int32Array, piMask: Int32Array, water: boolean, s: number): void => {
       for (let b = 0; b < nv; b++) {
         const row = b * nu
         for (let a = 0; a < nu; ) {
@@ -780,25 +943,43 @@ export function extractSurface(
             a++
             continue
           }
-          const pi = v > 0 ? v : -v
-          const info = (water ? templates[pi]!.waterFaces : templates[pi]!.faces)![dirIdx]
-          if (v < 0) {
-            emitScanFace(info, ua === 0 ? a : va === 0 ? b : s, ua === 1 ? a : va === 1 ? b : s, ua === 2 ? a : va === 2 ? b : s)
-            mask[row + a] = 0
-            a++
-            continue
-          }
+          const anchor = piMask[row + a]
+          const info = (water ? templates[anchor]!.waterFaces : templates[anchor]!.faces)![dirIdx]
           let w = 1
-          while (a + w < nu && mask[row + a + w] === v) w++
+          if (coarseColors) {
+            while (a + w < nu && mask[row + a + w] !== 0) w++
+          } else {
+            while (a + w < nu && mask[row + a + w] === v) w++
+          }
           let h = 1
           grow: while (b + h < nv) {
             const below = (b + h) * nu + a
             for (let k = 0; k < w; k++) {
-              if (mask[below + k] !== v) break grow
+              if (coarseColors ? mask[below + k] === 0 : mask[below + k] !== v) break grow
             }
             h++
           }
-          emitMerged(info, dirIdx, a, b, s, w, h)
+          let cornerFlat: number[] | null = null
+          if (coarseColors && !water) {
+            // Corner i's signs run along the AO tangents, which swap the
+            // scan's u/v roles on west/east scans.
+            const t1IsU = T1_AXIS[dirIdx] === ua
+            const corners = CUBE_FACES[dirIdx].corners
+            const a1 = T1_AXIS[dirIdx]
+            const a2 = T2_AXIS[dirIdx]
+            for (let i = 0; i < 4; i++) {
+              const c = corners[i]
+              const su = c[a1] > 0 ? 1 : -1
+              const sv = c[a2] > 0 ? 1 : -1
+              const colSign = t1IsU ? su : sv
+              const rowSign = t1IsU ? sv : su
+              const col = a + (colSign > 0 ? w - 1 : 0)
+              const cell = (b + (rowSign > 0 ? h - 1 : 0)) * nu + col
+              cornerColors[i] = flatColors[mask[cell] >>> 8]
+            }
+            cornerFlat = cornerColors
+          }
+          emitMerged(info, dirIdx, a, b, s, w, h, v & 0xff, cornerFlat)
           for (let bb = 0; bb < h; bb++) {
             const clear = (b + bb) * nu + a
             for (let k = 0; k < w; k++) mask[clear + k] = 0
@@ -821,16 +1002,18 @@ export function extractSurface(
           const x = ua === 0 ? a : va === 0 ? b : s
           const y = ua === 1 ? a : va === 1 ? b : s
           const z = ua === 2 ? a : va === 2 ? b : s
-          if (rec.faces !== null && !culled(x, y, z, dir, rec.group)) {
-            blockMask[m] = faceAoClean(x, y, z, dirIdx) ? pi : -pi
+          if (keyLut[pi] !== 0 && !culled(x, y, z, dir, rec.group)) {
+            blockMask[m] = keyLut[pi] | cornerAo(x, y, z, dirIdx)
+            blockPi[m] = pi
           }
-          if (rec.waterFaces !== null && !waterCulled(x, y, z, dir)) {
-            waterMask[m] = pi
+          if (waterKeyLut[pi] !== 0 && !waterCulled(x, y, z, dir)) {
+            waterMask[m] = waterKeyLut[pi]
+            waterPi[m] = pi
           }
         }
       }
-      sweep(blockMask, false, s)
-      sweep(waterMask, true, s)
+      sweep(blockMask, blockPi, false, s)
+      sweep(waterMask, waterPi, true, s)
       if (onProgress) onProgress(scanProgress(dirIdx, s + 1, nd))
     }
   }

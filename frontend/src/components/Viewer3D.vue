@@ -8,9 +8,11 @@ import {
   asMeshResponse,
   buildMeshRequest,
   runMeshPipeline,
+  LOD_NOTICE,
   type MeshData,
   type MeshResult,
 } from '../render/meshWorker'
+import { lodLevelForDistance, type LodLevel } from '../render/lod'
 import type { AssetBundle } from '../types'
 import { applyTiledAtlas } from '../render/tiledMaterial'
 import BrandLoader from './BrandLoader.vue'
@@ -23,6 +25,8 @@ const error = ref('')
 const faceCount = ref(0)
 /** 0..1 decode+mesh fraction while loading; null shows the plain loader. */
 const progress = ref<number | null>(null)
+/** Degraded-render notice pinned above the canvas ('' hides it). */
+const notice = ref('')
 
 let dispose: (() => void) | null = null
 /** Live mesh worker, if one is mid-flight (terminated on dispose). */
@@ -103,7 +107,15 @@ function meshViaWorker(
         onProgress(msg.pct)
         armWatchdog()
       } else if (msg.type === 'done') {
-        settle(() => resolve({ mesh: msg.mesh, dims: msg.dims }))
+        settle(() =>
+          resolve({
+            mesh: msg.mesh,
+            dims: msg.dims,
+            coarse: msg.coarse,
+            degraded: msg.degraded,
+            notice: msg.notice,
+          }),
+        )
       } else {
         fail(new Error(msg.message))
       }
@@ -141,6 +153,7 @@ async function render() {
   error.value = ''
   faceCount.value = 0
   progress.value = null
+  notice.value = ''
 
   const width = container.value.clientWidth
   const height = container.value.clientHeight
@@ -159,11 +172,19 @@ async function render() {
   // 3. Decode + mesh off the main thread (inline fallback on worker
   //    failure); vanilla model quads with cull groups, AO and tint baked
   //    into vertex colors; opaque / cutout / translucent / flat ranges.
-  const { mesh, dims } = await meshWithFallback(gz, store?.bundle ?? null, (pct) => {
-    progress.value = pct
-  }, stale)
+  //    `coarse` is the distance-LOD mesh; `degraded` means the quad budget
+  //    was hit and `mesh` already is the coarse one.
+  const { mesh, dims, coarse, degraded, notice: pipelineNotice } = await meshWithFallback(
+    gz,
+    store?.bundle ?? null,
+    (pct) => {
+      progress.value = pct
+    },
+    stale,
+  )
   if (stale()) throw new RenderSuperseded()
   faceCount.value = mesh.faceCount
+  notice.value = degraded ? (pipelineNotice ?? LOD_NOTICE) : ''
 
   // 4. Build the three.js scene.
   const scene = new THREE.Scene()
@@ -180,13 +201,18 @@ async function render() {
   container.value.appendChild(renderer.domElement)
 
   const materials: THREE.Material[] = []
+  /** Full-precision level meshes — hidden as one group when the coarse
+   * level takes over. */
+  const fullMeshes: THREE.Mesh[] = []
   const addMesh = (range: { start: number; count: number }, material: THREE.Material) => {
     if (!range.count) {
       material.dispose()
       return
     }
     materials.push(material)
-    scene.add(new THREE.Mesh(rangeGeometry(mesh, range), material))
+    const entry = new THREE.Mesh(rangeGeometry(mesh, range), material)
+    fullMeshes.push(entry)
+    scene.add(entry)
   }
 
   if (store) {
@@ -215,6 +241,23 @@ async function render() {
     )
   }
 
+  // Coarse LOD level (distance switching): untextured flat material over
+  // the downsampled grid's baked colors; hidden until the camera pulls
+  // back past the enter threshold.
+  const coarseMeshes: THREE.Mesh[] = []
+  if (coarse) {
+    const material = new THREE.MeshLambertMaterial({ vertexColors: true })
+    if (coarse.ranges.flat.count) {
+      materials.push(material)
+      const entry = new THREE.Mesh(rangeGeometry(coarse, coarse.ranges.flat), material)
+      entry.visible = false
+      coarseMeshes.push(entry)
+      scene.add(entry)
+    } else {
+      material.dispose()
+    }
+  }
+
   const hemi = new THREE.HemisphereLight(0xffffff, 0x888877, 1.15)
   scene.add(hemi)
   const dir = new THREE.DirectionalLight(0xffffff, 0.9)
@@ -225,6 +268,9 @@ async function render() {
   const [dx, dy, dz] = dims
   const center = new THREE.Vector3(dx / 2, dy / 2, dz / 2)
   const radius = Math.max(dx, dy, dz) / 2 || 1
+  /** Bounding-sphere radius (half the diagonal) — the unit the LOD switch
+   * thresholds are expressed in. */
+  const lodRadius = Math.hypot(dx, dy, dz) / 2 || 1
   camera.position.set(
     center.x + radius * 1.6,
     center.y + radius * 1.3,
@@ -240,9 +286,19 @@ async function render() {
   controls.enableDamping = true
   controls.update()
 
+  // Level switch per frame: distance to the orbit target versus the
+  // bounding-sphere radius, with hysteresis (render/lod) so the border
+  // never flickers between the two meshes.
   let raf = 0
+  let level: LodLevel = 'full'
   const tick = () => {
     controls.update()
+    if (coarseMeshes.length > 0) {
+      level = lodLevelForDistance(camera.position.distanceTo(controls.target), lodRadius, level)
+      const coarseShown = level === 'coarse'
+      for (const entry of coarseMeshes) entry.visible = coarseShown
+      for (const entry of fullMeshes) entry.visible = !coarseShown
+    }
     renderer.render(scene, camera)
     raf = requestAnimationFrame(tick)
   }
@@ -328,6 +384,7 @@ onBeforeUnmount(stopRender)
     </div>
     <div v-else-if="error" class="viewer-overlay viewer-error">{{ error }}</div>
     <div v-else class="viewer-tip">拖拽旋转 · 滚轮缩放 · 右键平移</div>
+    <div v-if="notice && !loading && !error" class="viewer-notice">{{ notice }}</div>
   </div>
 </template>
 
@@ -346,5 +403,22 @@ onBeforeUnmount(stopRender)
 .viewer-error {
   color: var(--zhimo-danger, #9e2f1c);
   font-size: 0.95rem;
+}
+
+/* Degraded-render notice pinned above the canvas — same paper-pill
+   vocabulary as the tip/overlay, pointer-transparent so the orbit
+   controls underneath keep working. */
+.viewer-notice {
+  position: absolute;
+  top: 0.6rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.78rem;
+  color: var(--zhimo-fg-muted, #968d7c);
+  background: color-mix(in srgb, var(--zhimo-bg, #faf7f0) 78%, transparent);
+  padding: 0.15rem 0.6rem;
+  border-radius: var(--zhimo-radius-sm, 2px);
+  pointer-events: none;
+  white-space: nowrap;
 }
 </style>

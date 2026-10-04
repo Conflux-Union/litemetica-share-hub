@@ -155,13 +155,30 @@ describe('asMeshResponse', () => {
     const gz = toBuffer(encodePreview([2, 1, 1], ['minecraft:stone'], [[0, 2]]))
     const { mesh, dims } = runMeshPipeline(gz, null)
     const done = { type: 'done' as const, mesh, dims }
-    expect(asMeshResponse(done)).toEqual(done)
+    expect(asMeshResponse(done)).toEqual({ ...done, coarse: null, degraded: false, notice: null })
 
     const broken = { ...done, mesh: { ...mesh, positions: new Uint32Array(0) } }
     expect(asMeshResponse(broken)).toBeNull()
     expect(asMeshResponse({ ...done, dims: [1, 1] })).toBeNull()
     expect(asMeshResponse({ ...done, dims: [1, 1, Number.POSITIVE_INFINITY] })).toBeNull()
     expect(asMeshResponse({ type: 'done', mesh: null, dims })).toBeNull()
+  })
+
+  it('accepts a degraded done message and rejects a damaged coarse mesh', () => {
+    const gz = toBuffer(encodePreview([8, 8, 8], ['minecraft:stone'], [[0, 512]]))
+    const result = runMeshPipeline(gz, null, undefined, { maxQuads: 4 })
+    const done = {
+      type: 'done' as const,
+      mesh: result.mesh,
+      dims: result.dims,
+      coarse: null,
+      degraded: true,
+      notice: '原理图过大,已自动降低精度显示',
+    }
+    expect(asMeshResponse(done)).toEqual(done)
+    expect(asMeshResponse({ ...done, degraded: 'yes' })).toBeNull()
+    expect(asMeshResponse({ ...done, notice: 7 })).toBeNull()
+    expect(asMeshResponse({ ...done, coarse: { broken: true } })).toBeNull()
   })
 })
 
@@ -236,6 +253,34 @@ describe('runMeshPipeline', () => {
   it('propagates decode format errors verbatim', () => {
     const gz = toBuffer(gzipSync(new TextEncoder().encode('{"schema":2}')))
     expect(() => runMeshPipeline(gz, null)).toThrowError(/LPRV/)
+  })
+
+  it('degrades to the coarse mesh when the quad budget is hit', () => {
+    // 8³ solid stone: the flat fallback meshes to 6 greedy quads, so a
+    // budget of 4 trips the guardrail mid-mesh.
+    const gz = toBuffer(encodePreview([8, 8, 8], ['minecraft:stone'], [[0, 512]]))
+    const result = runMeshPipeline(gz, null, undefined, { maxQuads: 4 })
+    expect(result.degraded).toBe(true)
+    expect(result.notice).toBe('原理图过大,已自动降低精度显示')
+    expect(result.coarse).toBeNull()
+    expect(result.dims).toEqual([8, 8, 8])
+    // The 8³ grid downsamples to one stride-8 cell: a six-quad cube.
+    expect(result.mesh.faceCount).toBe(6)
+    expect(result.mesh.ranges.flat.count).toBe(result.mesh.indices.length)
+  })
+
+  it('builds the coarse LOD mesh alongside the full mesh above the threshold', () => {
+    const gz = toBuffer(encodePreview([8, 8, 8], ['minecraft:stone'], [[0, 512]]))
+    const result = runMeshPipeline(gz, null, undefined, { lodFaceCount: 1 })
+    expect(result.degraded).toBe(false)
+    expect(result.notice).toBeNull()
+    expect(result.mesh.faceCount).toBe(6) // full mesh stays primary
+    expect(result.coarse).not.toBeNull()
+    expect(result.coarse!.faceCount).toBe(6)
+    // Both meshes transfer zero-copy: twelve distinct buffers.
+    const transfer = meshTransferList(result.mesh, result.coarse)
+    expect(transfer).toHaveLength(12)
+    expect(new Set(transfer).size).toBe(12)
   })
 })
 

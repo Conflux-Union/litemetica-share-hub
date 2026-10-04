@@ -8,7 +8,13 @@
  *     bundle — AssetBundle plain-JSON shape, or null for flat-color fallback
  *   worker → main (in order):
  *     { type: 'progress', pct }        — 0..1 fraction, integer-percent steps
- *     { type: 'done', mesh, dims }     — every mesh buffer transferred zero-copy
+ *     { type: 'done', mesh, dims, coarse, degraded, notice }
+ *                                      — every mesh buffer transferred
+ *                                        zero-copy; `coarse` is the LOD mesh
+ *                                        for distance switching (null when
+ *                                        not built), `degraded`+`notice`
+ *                                        mark a budget fallback where `mesh`
+ *                                        already is the coarse mesh
  *     { type: 'error', message }       — pipeline failure, incl. the Chinese
  *                                        OOM guardrails thrown by decode/mesh
  *
@@ -20,7 +26,8 @@
 import type { AssetBundle } from '../types'
 import { bundleTintColors, surfaceAssetsFromBundle } from './bundle'
 import { decodePreview } from './decode'
-import { extractSurface, type MeshData } from './surface'
+import { buildLodMesh } from './lod'
+import { extractSurface, MeshBudgetError, type MeshData } from './surface'
 import { setTintColors } from './tint'
 
 /** The mesh shape this module's protocol carries (re-exported for the
@@ -37,16 +44,49 @@ export interface MeshRequest {
 
 export type MeshResponse =
   | { type: 'progress'; pct: number }
-  | { type: 'done'; mesh: MeshData; dims: [number, number, number] }
+  | {
+      type: 'done'
+      /** Full-precision mesh, or the coarse mesh when `degraded`. */
+      mesh: MeshData
+      dims: [number, number, number]
+      /** Coarse LOD mesh for distance switching; null when not built (small
+       * meshes, or degraded — there `mesh` already is the coarse one). */
+      coarse: MeshData | null
+      /** True when the full mesh hit the quad budget and the coarse mesh
+       * replaced it. */
+      degraded: boolean
+      /** User-facing notice shown with a degraded render; null otherwise. */
+      notice: string | null
+    }
   | { type: 'error'; message: string }
 
 export interface MeshResult {
   mesh: MeshData
   dims: [number, number, number]
+  coarse: MeshData | null
+  degraded: boolean
+  notice: string | null
 }
 
-/** Share of the pipeline spent decoding (the rest is meshing). */
+/** Notice text for a budget-degraded render. */
+export const LOD_NOTICE = '原理图过大,已自动降低精度显示'
+
+/** Above this full-precision face count the coarse LOD mesh is also built
+ * for distance switching. */
+const LOD_FACE_COUNT = 500_000
+
+/** Pipeline progress shares: decode 0..0.35, full mesh 0.35..0.8, coarse
+ * LOD (when built) 0.8..1. The windows are fixed so progress never
+ * regresses when the coarse build turns out to be needed. */
 const DECODE_WEIGHT = 0.35
+const COARSE_START = 0.8
+
+/** Pipeline overrides; tests stub a tiny quad budget to exercise the
+ * degradation path and a tiny LOD threshold to force the coarse build. */
+export interface PipelineLimits {
+  maxQuads?: number
+  lodFaceCount?: number
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers — message assembly / parsing
@@ -80,38 +120,71 @@ export function asMeshResponse(data: unknown): MeshResponse | null {
     case 'error':
       return typeof data.message === 'string' ? { type: 'error', message: data.message } : null
     case 'done': {
-      const { mesh, dims } = data
-      if (!isRecord(mesh) || !Array.isArray(dims) || dims.length !== 3) return null
+      const { mesh, dims, coarse, degraded, notice } = data
+      if (!isMeshData(mesh) || !Array.isArray(dims) || dims.length !== 3) return null
       if (!dims.every((d) => typeof d === 'number' && Number.isFinite(d))) return null
-      const valid =
-        mesh.positions instanceof Float32Array &&
-        mesh.normals instanceof Float32Array &&
-        mesh.uvs instanceof Float32Array &&
-        mesh.tileOrigins instanceof Float32Array &&
-        mesh.colors instanceof Float32Array &&
-        mesh.indices instanceof Uint32Array &&
-        isRecord(mesh.ranges) &&
-        typeof mesh.faceCount === 'number'
-      return valid
-        ? { type: 'done', mesh: mesh as unknown as MeshData, dims: dims as [number, number, number] }
-        : null
+      let coarseMesh: MeshData | null = null
+      if (coarse !== null && coarse !== undefined) {
+        if (!isMeshData(coarse)) return null
+        coarseMesh = coarse
+      }
+      if (degraded !== undefined && typeof degraded !== 'boolean') return null
+      if (notice !== undefined && notice !== null && typeof notice !== 'string') return null
+      return {
+        type: 'done',
+        mesh,
+        dims: dims as [number, number, number],
+        coarse: coarseMesh,
+        degraded: degraded === true,
+        notice: typeof notice === 'string' ? notice : null,
+      }
     }
     default:
       return null
   }
 }
 
+/** Structural check of a MeshData payload (typed arrays survive the
+ * structured clone as the same views). */
+function isMeshData(value: unknown): value is MeshData {
+  if (!isRecord(value)) return false
+  return (
+    value.positions instanceof Float32Array &&
+    value.normals instanceof Float32Array &&
+    value.uvs instanceof Float32Array &&
+    value.tileOrigins instanceof Float32Array &&
+    value.colors instanceof Float32Array &&
+    value.indices instanceof Uint32Array &&
+    isRecord(value.ranges) &&
+    typeof value.faceCount === 'number'
+  )
+}
+
 /** Every mesh attribute buffer — the transfer list for the done message,
- * moving all vertex data to the main thread without a copy. */
-export function meshTransferList(mesh: MeshData): ArrayBuffer[] {
-  return [
+ * moving all vertex data to the main thread without a copy. `coarse`, when
+ * a separate LOD mesh was built, appends its buffers (the degraded case
+ * passes none: `mesh` already is the coarse mesh, and an ArrayBuffer may
+ * appear in a transfer list only once). */
+export function meshTransferList(mesh: MeshData, coarse: MeshData | null = null): ArrayBuffer[] {
+  const list: ArrayBuffer[] = [
     mesh.positions.buffer,
     mesh.normals.buffer,
     mesh.uvs.buffer,
     mesh.tileOrigins.buffer,
     mesh.colors.buffer,
     mesh.indices.buffer,
-  ] as ArrayBuffer[]
+  ]
+  if (coarse && coarse !== mesh) {
+    list.push(
+      coarse.positions.buffer,
+      coarse.normals.buffer,
+      coarse.uvs.buffer,
+      coarse.tileOrigins.buffer,
+      coarse.colors.buffer,
+      coarse.indices.buffer,
+    )
+  }
+  return list
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +196,7 @@ export function runMeshPipeline(
   gz: ArrayBuffer,
   bundle: AssetBundle | null,
   onProgress?: (pct: number) => void,
+  limits?: PipelineLimits,
 ): MeshResult {
   const grid = decodePreview(new Uint8Array(gz), (f) => onProgress?.(f * DECODE_WEIGHT))
   if (bundle) {
@@ -131,13 +205,36 @@ export function runMeshPipeline(
     // on the main thread).
     setTintColors(bundleTintColors(bundle))
   }
-  const mesh = extractSurface(
-    grid,
-    bundle ? surfaceAssetsFromBundle(bundle) : null,
-    undefined,
-    (f) => onProgress?.(DECODE_WEIGHT + f * (1 - DECODE_WEIGHT)),
-  )
-  return { mesh, dims: grid.dims }
+  const assets = bundle ? surfaceAssetsFromBundle(bundle) : null
+
+  // Full-precision mesh; the quad-budget guardrail degrades to the coarse
+  // LOD mesh below instead of failing the render (decode-side errors —
+  // including its own volume guard — still propagate: without a decoded
+  // grid there is nothing to downsample).
+  let full: MeshData | null = null
+  const meshLimits = limits?.maxQuads === undefined ? undefined : { maxQuads: limits.maxQuads }
+  try {
+    full = extractSurface(
+      grid,
+      assets,
+      undefined,
+      (f) => onProgress?.(DECODE_WEIGHT + f * (COARSE_START - DECODE_WEIGHT)),
+      meshLimits,
+    )
+  } catch (e) {
+    if (!(e instanceof MeshBudgetError)) throw e
+  }
+
+  // Small meshes render alone; large ones also get a coarse mesh for
+  // distance switching, and a budget-degraded render IS the coarse mesh.
+  if (full && full.faceCount <= (limits?.lodFaceCount ?? LOD_FACE_COUNT)) {
+    onProgress?.(1)
+    return { mesh: full, dims: grid.dims, coarse: null, degraded: false, notice: null }
+  }
+  const lod = buildLodMesh(grid, (f) => onProgress?.(COARSE_START + f * (1 - COARSE_START)))
+  return full
+    ? { mesh: full, dims: grid.dims, coarse: lod.mesh, degraded: false, notice: null }
+    : { mesh: lod.mesh, dims: grid.dims, coarse: null, degraded: true, notice: LOD_NOTICE }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +259,8 @@ export function handleMeshRequest(request: MeshRequest, post: MeshPoster): void 
     post({ type: 'progress', pct: whole / 100 }, [])
   }
   try {
-    const { mesh, dims } = runMeshPipeline(request.gz, request.bundle, onProgress)
-    post({ type: 'done', mesh, dims }, meshTransferList(mesh))
+    const { mesh, dims, coarse, degraded, notice } = runMeshPipeline(request.gz, request.bundle, onProgress)
+    post({ type: 'done', mesh, dims, coarse, degraded, notice }, meshTransferList(mesh, coarse))
   } catch (e) {
     post({ type: 'error', message: e instanceof Error ? e.message : String(e) }, [])
   }
