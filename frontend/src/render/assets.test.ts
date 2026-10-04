@@ -1,12 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import * as THREE from 'three'
 import type { AssetBundle } from '../types'
 import {
   buildTileTransforms,
+  makeLookups,
   normalizeBlockStates,
   normalizeModel,
-  stateTexture,
-  type AssetStore,
 } from './assets'
 import { resolveStateGeometry, type BlockstateJson, type VanillaAssets } from './model'
 
@@ -88,7 +86,9 @@ describe('buildTileTransforms', () => {
   })
 })
 
-describe('stateTexture (representative texture per state)', () => {
+describe('makeLookups (namespace-tolerant bundle lookups)', () => {
+  // 26.x model files mix namespaced and bare texture references; atlas
+  // keys are always namespaced (repeater/comparator/brewing-stand family).
   const bundle = {
     formatVersion: 2,
     minecraftVersion: 'test',
@@ -104,111 +104,19 @@ describe('stateTexture (representative texture per state)', () => {
     tintColors: {},
   } as unknown as AssetBundle
 
-  const assets: VanillaAssets = {
-    blockStates: normalizeBlockStates({
-      'minecraft:block/stone': { variants: { '': { model: 'minecraft:block/stone' } } },
-      'minecraft:block/glass_block': { variants: { '': { model: 'minecraft:block/glass_block' } } },
-      'minecraft:block/flat': { variants: { '': { model: 'minecraft:block/flat' } } },
-      // Vanilla stairs shape: every variant conditioned on properties.
-      'minecraft:block/stairs_multi': {
-        variants: {
-          'facing=east,half=bottom,shape=straight': { model: 'minecraft:block/stairs_multi' },
-          'facing=north,half=bottom,shape=straight': {
-            model: 'minecraft:block/stairs_multi',
-            y: 270,
-          },
-        },
-      } as BlockstateJson,
-    } as Record<string, BlockstateJson>),
-    blockModels: {
-      'minecraft:block/stone': normalizeModel({
-        textures: { all: 'minecraft:block/stone' },
-        elements: [
-          {
-            from: [0, 0, 0],
-            to: [16, 16, 16],
-            faces: {
-              up: { texture: '#all' },
-              down: { texture: '#all' },
-              north: { texture: '#all' },
-              south: { texture: '#all' },
-              west: { texture: '#all' },
-              east: { texture: '#all' },
-            },
-          },
-        ],
-      }),
-      // Top face stone, sides glass: face preference must discriminate.
-      'minecraft:block/glass_block': normalizeModel({
-        textures: { top: 'minecraft:block/stone', side: 'minecraft:block/glass' },
-        elements: [
-          {
-            from: [0, 0, 0],
-            to: [16, 16, 16],
-            faces: {
-              up: { texture: '#top' },
-              north: { texture: '#side' },
-              south: { texture: '#side' },
-            },
-          },
-        ],
-      }),
-      // Only an up-facing quad (dust-like): side falls back to it.
-      'minecraft:block/flat': normalizeModel({
-        textures: { line: 'minecraft:block/stone' },
-        elements: [
-          {
-            from: [0, 0, 6],
-            to: [16, 2, 10],
-            faces: { up: { texture: '#line' } },
-          },
-        ],
-      }),
-      // Material-table icon input is a bare id; conditioned variant tables
-      // must still resolve a shape (first-variant fallback).
-      'minecraft:block/stairs_multi': normalizeModel({
-        textures: { all: 'minecraft:block/stone' },
-        elements: [
-          {
-            from: [0, 0, 0],
-            to: [16, 8, 16],
-            faces: { up: { texture: '#all' }, north: { texture: '#all' } },
-          },
-        ],
-      }),
-    },
-  }
-
-  const transforms = buildTileTransforms(bundle)
-  const store: AssetStore = {
-    bundle,
-    texture: {} as THREE.Texture,
-    assets,
-    tileTransform: (id) => transforms.get(id) ?? null,
-    alphaClass: (id) => bundle.textures[id]?.alpha ?? 'opaque',
-    tintColors: { grass: [0, 0, 0], foliage: [0, 0, 0] },
-  }
-
-  it('prefers the quad matching the requested face slot', () => {
-    expect(stateTexture(store, 'minecraft:glass_block', 'top')).toBe('minecraft:block/stone')
-    expect(stateTexture(store, 'minecraft:glass_block', 'side')).toBe('minecraft:block/glass')
-    expect(stateTexture(store, 'minecraft:stone[anything=1]', 'bottom')).toBe(
-      'minecraft:block/stone',
-    )
+  it('resolves bare texture ids to their namespaced atlas entries', () => {
+    const { tileTransform, alphaClass } = makeLookups(bundle)
+    expect(tileTransform('block/stone')).toEqual(tileTransform('minecraft:block/stone'))
+    expect(tileTransform('block/stone')).not.toBeNull()
+    expect(alphaClass('block/glass')).toBe('translucent')
   })
 
-  it('falls back to any atlas-backed quad for flat blocks', () => {
-    expect(stateTexture(store, 'minecraft:flat', 'side')).toBe('minecraft:block/stone')
-  })
-
-  it('resolves bare ids of multi-variant blocks to the first variant (material icons)', () => {
-    // The backend material list always reports property-less ids; stairs
-    // and friends must still produce an icon texture, not null.
-    expect(stateTexture(store, 'minecraft:stairs_multi', 'side')).toBe('minecraft:block/stone')
-  })
-
-  it('returns null for states without a resolvable texture', () => {
-    expect(stateTexture(store, 'minecraft:unknown_block', 'side')).toBeNull()
+  it('keeps namespaced ids and reports unknown textures as absent/opaque', () => {
+    const { tileTransform, alphaClass } = makeLookups(bundle)
+    expect(tileTransform('minecraft:block/stone')).not.toBeNull()
+    expect(tileTransform('minecraft:missingno')).toBeNull()
+    expect(tileTransform('missingno:block/stone')).toBeNull()
+    expect(alphaClass('minecraft:missingno')).toBe('opaque')
   })
 })
 

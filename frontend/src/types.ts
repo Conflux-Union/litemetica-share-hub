@@ -111,6 +111,10 @@ export interface AssetBundle {
   blockStates: Record<string, unknown>
   /** Keyed "minecraft:block/<path>", vanilla model JSON verbatim. */
   blockModels: Record<string, BundleModel>
+  /** Format 3+: item models for the material universe (vanilla shows
+   * redstone/rails/bell/torches… as item sprites, not placed blocks).
+   * Absent on older bundles — icon rendering falls back to blockstates. */
+  itemModels?: Record<string, BundleModel>
   textures: Record<string, BundleTexture>
   /** 0..255 rgb sampled from the colormaps' center pixels (default biome). */
   tintColors: Partial<Record<'grass' | 'foliage', [number, number, number]>>

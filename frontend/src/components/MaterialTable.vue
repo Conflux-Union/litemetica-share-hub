@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import type { MaterialEntry } from '../types'
-import { loadAssets, stateTexture } from '../render/assets'
+import { loadAssets } from '../render/assets'
+import { blockIconDataURL } from '../render/icon'
 import { blockColorHex } from '../render/colors'
 
 const props = defineProps<{ materials: MaterialEntry[] }>()
@@ -26,30 +27,17 @@ const rows = computed(() => {
 
 const total = computed(() => props.materials.reduce((s, m) => s + m.count, 0))
 
-// Block icons: 16x16 crops of the block's side-model atlas tile, or flat
-// colors as fallback.
+// Block icons: inventory-style isometric renders of each block's model
+// (render/icon), or flat colors as fallback.
 const iconUrls = ref(new Map<string, string>())
 
 onMounted(async () => {
   const store = await loadAssets()
   if (!store) return
-  const img = store.texture.image as HTMLImageElement
-  const tile = store.bundle.tile
-  const canvas = document.createElement('canvas')
-  canvas.width = 16
-  canvas.height = 16
-  const ctx = canvas.getContext('2d')!
-  ctx.imageSmoothingEnabled = false
   const out = new Map<string, string>()
   for (const m of props.materials) {
-    const texId = stateTexture(store, m.item_id, 'side')
-    if (!texId) continue
-    const entry = store.bundle.textures[texId]
-    if (!entry) continue
-    const [col, row] = entry.uv
-    ctx.clearRect(0, 0, 16, 16)
-    ctx.drawImage(img, col * tile, row * tile, tile, tile, 0, 0, 16, 16)
-    out.set(m.item_id, canvas.toDataURL())
+    const url = blockIconDataURL(store, m.item_id, 64)
+    if (url) out.set(m.item_id, url)
   }
   iconUrls.value = out
 })

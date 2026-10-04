@@ -76,7 +76,7 @@ export function formatState(state: BlockState): string {
 }
 
 /** Parse a variant key "facing=east,half=bottom" into its condition map. */
-function parseVariantKey(key: string): Record<string, string> {
+export function parseVariantKey(key: string): Record<string, string> {
   const cond: Record<string, string> = {}
   for (const pair of key.split(',')) {
     const eq = pair.indexOf('=')

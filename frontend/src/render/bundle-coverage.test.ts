@@ -210,10 +210,13 @@ suite('render bundle placeholder coverage', () => {
   }
 
   it('loads a usable bundle', () => {
-    expect(bundle.formatVersion).toBe(2)
+    expect(bundle.formatVersion).toBe(3)
     expect(Object.keys(rawStates).length).toBeGreaterThan(0)
     expect(Object.keys(rawModels).length).toBeGreaterThan(0)
     expect(Object.keys(textures).length).toBeGreaterThan(0)
+    // Material items that vanilla shows as sprites must carry item models.
+    expect(Object.keys(bundle.itemModels ?? {}).length).toBeGreaterThan(100)
+    expect(bundle.itemModels).toHaveProperty('minecraft:item/redstone')
   })
 
   it('renders every blockstate family with real geometry (no purple placeholders)', () => {

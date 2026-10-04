@@ -11,7 +11,7 @@
 import * as THREE from 'three'
 import { gunzipSync } from 'fflate'
 import type { AlphaClass, AssetBundle, BundleModel, SpriteRef } from '../types'
-import { resolveStateGeometry, type BlockstateJson, type ModelJson, type Quad, type VanillaAssets } from './model'
+import type { BlockstateJson, ModelJson, VanillaAssets } from './model'
 import { DEFAULT_TINT_COLORS, setTintColors, type Rgb } from './tint'
 
 /**
@@ -36,7 +36,9 @@ export interface AssetStore {
    * re-keyed to state names, model texture maps sprite-unwrapped. */
   assets: VanillaAssets
   /** Tile mapping for a texture id, or null when the texture is absent
-   * from the atlas (e.g. minecraft:missingno) — render the placeholder. */
+   * from the atlas (e.g. minecraft:missingno) — render the placeholder.
+   * Namespace-tolerant: bare ids ("block/stone") resolve to their
+   * namespaced atlas entry. */
   tileTransform(textureId: string): TileTransform | null
   /** Alpha class of an atlas texture; unknown ids read as opaque. */
   alphaClass(textureId: string): AlphaClass
@@ -104,26 +106,27 @@ export function buildTileTransforms(bundle: AssetBundle): Map<string, TileTransf
 }
 
 /**
- * Representative atlas texture id of a block state, preferring a quad whose
- * normal matches the requested face slot (top/side/bottom) and falling back
- * to any atlas-backed quad. Null when the state has no resolvable texture
- * (unknown block / placeholder). Used by the material-table icons and as
- * the bridge for the legacy mesher's per-face UV lookup.
+ * Namespace-tolerant texture-id resolution: atlas keys are always
+ * fully-qualified, but 26.x model files reference textures both
+ * namespaced ("minecraft:block/snow") and bare ("block/stone" — the
+ * repeater/comparator/brewing-stand family). Bare ids read as
+ * "minecraft:<id>"; ids that already carry a namespace pass through.
  */
-export function stateTexture(
-  store: AssetStore,
-  stateKey: string,
-  face: 'top' | 'side' | 'bottom',
-): string | null {
-  const geo = resolveStateGeometry(stateKey, store.assets)
-  const candidates = geo.quads.filter((q) => store.tileTransform(q.texture) !== null)
-  const preferred: (q: Quad) => boolean =
-    face === 'top'
-      ? (q) => q.normal[1] > 0.5
-      : face === 'bottom'
-        ? (q) => q.normal[1] < -0.5
-        : (q) => Math.abs(q.normal[1]) < 0.5
-  return (candidates.find(preferred) ?? candidates[0])?.texture ?? null
+export function resolveTextureId(bundle: AssetBundle, id: string): string {
+  return id in bundle.textures || id.includes(':') ? id : `minecraft:${id}`
+}
+
+/** Bundle lookups shared by the viewer mesher, the icon renderer and
+ * tests; both are namespace-tolerant via {@link resolveTextureId}. */
+export function makeLookups(bundle: AssetBundle): {
+  tileTransform: AssetStore['tileTransform']
+  alphaClass: AssetStore['alphaClass']
+} {
+  const transforms = buildTileTransforms(bundle)
+  return {
+    tileTransform: (id) => transforms.get(resolveTextureId(bundle, id)) ?? null,
+    alphaClass: (id) => bundle.textures[resolveTextureId(bundle, id)]?.alpha ?? 'opaque',
+  }
 }
 
 function isUsableBundle(bundle: AssetBundle): boolean {
@@ -183,11 +186,18 @@ async function fetchAssets(): Promise<AssetStore | null> {
 
   const assets: VanillaAssets = {
     blockStates: normalizeBlockStates(bundle.blockStates as Record<string, BlockstateJson>),
-    blockModels: Object.fromEntries(
-      Object.entries(bundle.blockModels).map(([id, model]) => [id, normalizeModel(model)]),
-    ),
+    // Item models join the model map so flattenModel can walk parent
+    // chains across block and item models (keys never collide).
+    blockModels: {
+      ...Object.fromEntries(
+        Object.entries(bundle.blockModels).map(([id, model]) => [id, normalizeModel(model)]),
+      ),
+      ...Object.fromEntries(
+        Object.entries(bundle.itemModels ?? {}).map(([id, model]) => [id, normalizeModel(model)]),
+      ),
+    },
   }
-  const transforms = buildTileTransforms(bundle)
+  const lookups = makeLookups(bundle)
 
   const toRgb = (v: [number, number, number]): Rgb => [v[0] / 255, v[1] / 255, v[2] / 255]
   const tintColors = {
@@ -203,8 +213,8 @@ async function fetchAssets(): Promise<AssetStore | null> {
     bundle,
     texture,
     assets,
-    tileTransform: (id) => transforms.get(id) ?? null,
-    alphaClass: (id) => bundle.textures[id]?.alpha ?? 'opaque',
+    tileTransform: lookups.tileTransform,
+    alphaClass: lookups.alphaClass,
     tintColors,
   }
 }
