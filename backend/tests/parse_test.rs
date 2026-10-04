@@ -60,7 +60,7 @@ fn parse_pipeline_roundtrip() {
     let schem = build_test_litematic();
     let bytes = schem.to_bytes().expect("serialize test litematic");
 
-    let parsed = parse::parse_litematic(&bytes).expect("parse test litematic");
+    let parsed = parse::parse_litematic(&bytes, 512 * 1024 * 1024).expect("parse test litematic");
 
     assert_eq!(parsed.name, "测试原理图");
     assert_eq!(parsed.author, "tester");
@@ -110,7 +110,7 @@ fn parse_pipeline_roundtrip() {
     }
     assert_eq!(expanded.len(), volume);
 
-    // Iteration order is x fastest, then z, then y (matching rustmatica's Blocks).
+    // Iteration order is x fastest, then z, then y (litematica storage order).
     let lookup = |x: usize, y: usize, z: usize| -> usize { y * (2 * 4) + z * 4 + x };
     assert_eq!(expanded[lookup(0, 0, 0)], "minecraft:stone");
     assert_eq!(expanded[lookup(1, 0, 0)], "minecraft:oak_wall_sign");
@@ -132,7 +132,7 @@ fn parse_pipeline_roundtrip() {
 
 #[test]
 fn rejects_garbage() {
-    assert!(parse::parse_litematic(b"not a litematic").is_err());
+    assert!(parse::parse_litematic(b"not a litematic", 512 * 1024 * 1024).is_err());
 }
 
 #[test]

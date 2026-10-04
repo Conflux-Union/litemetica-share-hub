@@ -1171,6 +1171,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "litematica"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "361346b22f59592cbc5e8df85b2bcbbcc6e20b62b0b0f43402ec62f48216b36a"
+dependencies = [
+ "flate2",
+ "thiserror",
+]
+
+[[package]]
 name = "litemetica-share-hub"
 version = "0.1.0"
 dependencies = [
@@ -1178,6 +1188,7 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "image",
+ "litematica",
  "mcdata",
  "rand 0.8.8",
  "reqwest",

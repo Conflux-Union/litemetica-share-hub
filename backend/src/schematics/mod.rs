@@ -259,8 +259,9 @@ pub async fn upload(
 
     // Parsing may take a while for large schematics; keep it off the async workers.
     let size_bytes = bytes.len() as i64;
+    let decompress_limit = state.config.limits.max_decompressed_mb * 1024 * 1024;
     let (bytes, parsed_result) = tokio::task::spawn_blocking(move || {
-        let result = parse::parse_litematic(&bytes);
+        let result = parse::parse_litematic(&bytes, decompress_limit);
         (bytes, result)
     })
     .await
@@ -403,10 +404,15 @@ pub struct RegenReport {
 /// Re-parse every stored `.litematic` and rewrite its cached preview payload
 /// with the current format (used to migrate previews after schema changes).
 /// A failing schematic is recorded and skipped; the rest are still processed.
-pub fn regen_previews(storage: &storage::Storage) -> std::io::Result<RegenReport> {
+/// `decompress_limit` is the gzip-inflated NBT cap in bytes, mirroring the
+/// serving path.
+pub fn regen_previews(
+    storage: &storage::Storage,
+    decompress_limit: u64,
+) -> std::io::Result<RegenReport> {
     let mut report = RegenReport::default();
     for id in storage.schematic_ids()? {
-        match regen_preview(storage, &id) {
+        match regen_preview(storage, &id, decompress_limit) {
             Ok(()) => report.regenerated.push(id),
             Err(err) => report.failed.push((id, err)),
         }
@@ -414,11 +420,15 @@ pub fn regen_previews(storage: &storage::Storage) -> std::io::Result<RegenReport
     Ok(report)
 }
 
-fn regen_preview(storage: &storage::Storage, id: &str) -> Result<(), String> {
+fn regen_preview(
+    storage: &storage::Storage,
+    id: &str,
+    decompress_limit: u64,
+) -> Result<(), String> {
     let bytes = storage
         .read_schematic(id)
         .map_err(|e| format!("cannot read schematic: {e}"))?;
-    let parsed = parse::parse_litematic(&bytes)?;
+    let parsed = parse::parse_litematic(&bytes, decompress_limit)?;
     let value = serde_json::to_value(&parsed.preview)
         .map_err(|e| format!("cannot serialize preview: {e}"))?;
     storage
@@ -498,7 +508,11 @@ mod regen_tests {
         storage.store_schematic("bad", b"not a litematic").unwrap();
         storage.store_schematic("good2", &bytes).unwrap();
 
-        let report = regen_previews(&storage).unwrap();
+        let report = regen_previews(
+            &storage,
+            crate::config::DEFAULT_MAX_DECOMPRESSED_MB * 1024 * 1024,
+        )
+        .unwrap();
         assert_eq!(
             report.regenerated,
             vec!["good1".to_string(), "good2".to_string()]

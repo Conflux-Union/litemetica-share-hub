@@ -15,6 +15,9 @@ redirect_uri = "http://localhost:8080/oauth/callback"
 download_per_ip = 3
 download_window_secs = 60
 max_upload_mb = 64
+# Cap on the gzip-inflated NBT size of an upload, in MB. A small .litematic
+# can inflate a hundredfold; parsing memory is bounded by this value.
+max_decompressed_mb = 512
 # Minimum RMSSSO permission_level required to upload schematics.
 min_permission_level = 1
 # Set true only when running behind a reverse proxy that sets X-Forwarded-For.

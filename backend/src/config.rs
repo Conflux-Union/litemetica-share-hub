@@ -24,8 +24,21 @@ pub struct LimitsConfig {
     pub download_per_ip: u32,
     pub download_window_secs: u64,
     pub max_upload_mb: u64,
+    /// Cap on the gzip-inflated NBT size of an uploaded schematic. This is
+    /// the real memory bound of parsing: a small uploaded file can inflate
+    /// a hundredfold.
+    #[serde(default = "default_max_decompressed_mb")]
+    pub max_decompressed_mb: u64,
     pub min_permission_level: i64,
     pub trust_x_forwarded_for: bool,
+}
+
+/// Default for [`LimitsConfig::max_decompressed_mb`]; also usable directly
+/// by offline code paths (regen CLI, tests).
+pub const DEFAULT_MAX_DECOMPRESSED_MB: u64 = 512;
+
+fn default_max_decompressed_mb() -> u64 {
+    DEFAULT_MAX_DECOMPRESSED_MB
 }
 
 impl Default for LimitsConfig {
@@ -34,6 +47,7 @@ impl Default for LimitsConfig {
             download_per_ip: 3,
             download_window_secs: 60,
             max_upload_mb: 64,
+            max_decompressed_mb: DEFAULT_MAX_DECOMPRESSED_MB,
             min_permission_level: 1,
             trust_x_forwarded_for: false,
         }

@@ -14,8 +14,7 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-rustmatica = "0.5"
-mcdata = "0.4"
+litematica = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +28,12 @@ rust-embed = "8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flate2 = "1"
+
+# rustmatica/mcdata are only needed to WRITE litematic fixtures in tests
+# and the smoke-fixture generator; the serving path reads via `litematica`.
+[dev-dependencies]
+rustmatica = "0.5"
+mcdata = "0.4"
 
 [profile.release]
 lto = "thin"

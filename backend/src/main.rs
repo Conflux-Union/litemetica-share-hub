@@ -55,7 +55,10 @@ async fn main() {
             let data_dir = resolve_data_dir(&config);
             let storage =
                 schematics::storage::Storage::new(&data_dir).expect("create storage dirs");
-            match schematics::regen_previews(&storage) {
+            match schematics::regen_previews(
+                &storage,
+                config.limits.max_decompressed_mb * 1024 * 1024,
+            ) {
                 Ok(report) => {
                     for id in &report.regenerated {
                         println!("regenerated preview for {id}");

@@ -1,5 +1,4 @@
-use mcdata::GenericBlockState;
-use rustmatica::Litematic;
+use litematica::{decompress_gzip_with_limit, BlockState, Document};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -74,14 +73,14 @@ pub struct ParsedSchematic {
 /// Format a block state as the canonical state string `name[k=v,...]` with
 /// properties sorted by key, so equal states always serialize identically.
 /// Blocks without properties serialize as the bare block name.
-fn state_key(block: &GenericBlockState) -> String {
+fn state_key(block: &BlockState) -> String {
     if block.properties.is_empty() {
-        return block.name.clone().into_owned();
+        return block.name.clone();
     }
     let mut props: Vec<(&str, &str)> = block
         .properties
         .iter()
-        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     props.sort_unstable();
     let mut key = String::with_capacity(block.name.len() + props.len() * 8);
@@ -198,52 +197,64 @@ fn zh_name(item_id: &str) -> String {
         .unwrap_or_else(|| short.to_string())
 }
 
-/// Parse a .litematic byte blob into metadata, material list, and RLE preview data.
-pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
-    let schem: Litematic =
-        Litematic::from_bytes(bytes).map_err(|e| format!("无法解析 litematic 文件: {e}"))?;
-    if schem.regions.is_empty() {
+/// Parse a .litematic byte blob into metadata, material list, and RLE preview
+/// data. `decompress_limit` bounds the gzip-inflated NBT size (bytes), which
+/// is the real memory cost of parsing an untrusted file.
+///
+/// Uses the streaming `litematica` reader: the NBT payload is scanned once
+/// without building a tree, and block indices are decoded on the fly from the
+/// borrowed `BlockStates` payload instead of being expanded into a per-voxel
+/// vector.
+pub fn parse_litematic(bytes: &[u8], decompress_limit: u64) -> Result<ParsedSchematic, String> {
+    let nbt = decompress_gzip_with_limit(bytes, decompress_limit).map_err(|e| match e {
+        litematica::Error::SizeLimitExceeded { .. } => format!(
+            "文件解压后超过 {} MB 上限，文件过大",
+            decompress_limit / (1024 * 1024)
+        ),
+        other => format!("无法解压 litematic 文件: {other}"),
+    })?;
+    let doc = Document::parse(&nbt).map_err(|e| format!("无法解析 litematic 文件: {e}"))?;
+    if doc.regions.is_empty() {
         return Err("litematic 文件不包含任何区域 (region)".into());
     }
 
-    let meta = &schem.metadata;
-    let enclosing = schem.enclosing_size();
+    let meta = &doc.metadata;
+    let enclosing = doc.enclosing_size().unwrap_or([0i32; 3]);
 
     let mut item_counts: HashMap<String, u64> = HashMap::new();
     let mut total_blocks: u64 = 0;
-    let mut regions_out = Vec::with_capacity(schem.regions.len());
+    let mut regions_out = Vec::with_capacity(doc.regions.len());
 
-    for region in &schem.regions {
-        let palette = region.block_palette();
-        // `blocks()` yields references into the palette, so pointer identity gives
-        // an O(1) block-state -> palette-index lookup without hashing the states.
-        let mut ptr_to_idx: HashMap<*const _, u32> = HashMap::with_capacity(palette.len());
-        for (i, b) in palette.iter().enumerate() {
-            ptr_to_idx.insert(b as *const _, i as u32);
-        }
-
+    for region in &doc.regions {
+        let palette = region.palette();
         let palette_states: Vec<String> = palette.iter().map(state_key).collect();
 
         // Count materials per palette entry and build the RLE in one pass.
+        // iter_blocks yields raw indices in storage order (x fastest, then z,
+        // then y) and does not validate them against the palette, so a corrupt
+        // file is rejected here instead of panicking.
         let mut entry_counts = vec![0u64; palette.len()];
         let mut rle: Vec<[u64; 2]> = Vec::new();
-        let mut run: Option<(u32, u64)> = None;
-        for (_pos, block) in region.blocks() {
-            let idx = *ptr_to_idx
-                .get(&(block as *const _))
-                .expect("blocks iterator yields palette entries");
-            entry_counts[idx as usize] += 1;
+        let mut run: Option<(u64, u64)> = None;
+        for idx in region.iter_blocks() {
+            let idx = usize::try_from(idx)
+                .ok()
+                .filter(|i| *i < palette.len())
+                .ok_or_else(|| {
+                    format!("文件损坏：区域 {} 的方块索引超出 palette 范围", region.name)
+                })?;
+            entry_counts[idx] += 1;
             match run {
-                Some((cur, len)) if cur == idx => run = Some((cur, len + 1)),
+                Some((cur, len)) if cur == idx as u64 => run = Some((cur, len + 1)),
                 Some((cur, len)) => {
-                    rle.push([cur as u64, len]);
-                    run = Some((idx, 1));
+                    rle.push([cur, len]);
+                    run = Some((idx as u64, 1));
                 }
-                None => run = Some((idx, 1)),
+                None => run = Some((idx as u64, 1)),
             }
         }
         if let Some((cur, len)) = run {
-            rle.push([cur as u64, len]);
+            rle.push([cur, len]);
         }
 
         for (idx, count) in entry_counts.into_iter().enumerate() {
@@ -263,16 +274,16 @@ pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
         }
 
         regions_out.push(RegionPreview {
-            name: region.name.clone().into_owned(),
+            name: region.name.clone(),
             pos: [
-                region.position.x as i64,
-                region.position.y as i64,
-                region.position.z as i64,
+                i64::from(region.position[0]),
+                i64::from(region.position[1]),
+                i64::from(region.position[2]),
             ],
             size: [
-                region.size.x as i64,
-                region.size.y as i64,
-                region.size.z as i64,
+                i64::from(region.size[0]),
+                i64::from(region.size[1]),
+                i64::from(region.size[2]),
             ],
             palette: palette_states,
             rle,
@@ -290,21 +301,25 @@ pub fn parse_litematic(bytes: &[u8]) -> Result<ParsedSchematic, String> {
     materials.sort_by(|a, b| b.count.cmp(&a.count).then(a.item_id.cmp(&b.item_id)));
 
     Ok(ParsedSchematic {
-        name: meta.name.clone().into_owned(),
-        author: meta.author.clone().into_owned(),
-        description: meta.description.clone().into_owned(),
-        litematica_version: meta.version as i64,
-        mc_data_version: meta.minecraft_data_version as i64,
-        mc_version_name: mc_version_name(meta.minecraft_data_version as i64),
-        width: enclosing.x as i64,
-        height: enclosing.y as i64,
-        depth: enclosing.z as i64,
-        region_count: schem.regions.len(),
+        name: meta.name.clone(),
+        author: meta.author.clone(),
+        description: meta.description.clone(),
+        litematica_version: i64::from(meta.version),
+        mc_data_version: i64::from(meta.minecraft_data_version),
+        mc_version_name: mc_version_name(i64::from(meta.minecraft_data_version)),
+        width: i64::from(enclosing[0]),
+        height: i64::from(enclosing[1]),
+        depth: i64::from(enclosing[2]),
+        region_count: doc.regions.len(),
         total_blocks,
         materials,
         preview: PreviewData {
             schema: PREVIEW_SCHEMA_VERSION,
-            size: [enclosing.x as i64, enclosing.y as i64, enclosing.z as i64],
+            size: [
+                i64::from(enclosing[0]),
+                i64::from(enclosing[1]),
+                i64::from(enclosing[2]),
+            ],
             regions: regions_out,
         },
     })
@@ -339,12 +354,12 @@ mod tests {
         assert!(block_to_item("minecraft:water").is_none());
     }
 
-    fn state(name: &str, props: &[(&str, &str)]) -> GenericBlockState {
-        GenericBlockState {
-            name: name.to_string().into(),
+    fn state(name: &str, props: &[(&str, &str)]) -> BlockState {
+        BlockState {
+            name: name.to_string(),
             properties: props
                 .iter()
-                .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
     }
