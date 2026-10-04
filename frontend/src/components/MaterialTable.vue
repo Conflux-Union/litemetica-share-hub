@@ -4,6 +4,7 @@ import type { MaterialEntry } from '../types'
 import { loadAssets } from '../render/assets'
 import { blockIconDataURL } from '../render/icon'
 import { blockColorHex } from '../render/colors'
+import { formatStackSize } from '../format'
 
 const props = defineProps<{ materials: MaterialEntry[] }>()
 
@@ -71,9 +72,8 @@ function icon(m: MaterialEntry): { url?: string; color?: string } {
     <table class="data-table">
       <thead>
         <tr>
-          <th style="width: 36px"></th>
+          <th style="width: 48px"></th>
           <th @click="sortKey = 'name'">材料</th>
-          <th @click="sortKey = 'name'">ID</th>
           <th @click="sortKey = 'count'" style="text-align: right">数量</th>
         </tr>
       </thead>
@@ -86,9 +86,11 @@ function icon(m: MaterialEntry): { url?: string; color?: string } {
             ></span>
           </td>
           <td>{{ m.name_zh }}</td>
-          <td class="muted">{{ m.item_id.replace('minecraft:', '') }}</td>
-          <td style="text-align: right; font-variant-numeric: tabular-nums">
-            {{ m.count.toLocaleString() }}
+          <td
+            style="text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap"
+            :title="m.count.toLocaleString()"
+          >
+            {{ formatStackSize(m.count) }}
           </td>
         </tr>
       </tbody>

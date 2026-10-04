@@ -114,10 +114,15 @@ body {
 
 .block-icon {
   display: inline-block;
-  width: 20px;
-  height: 20px;
+  width: 32px;
+  height: 32px;
   vertical-align: middle;
   border-radius: 3px;
+  /* The data URL is a fixed 64×64 render; without sizing rules the
+     background paints at natural size and clips to the corner. */
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
 }
 
 .file-drop {
