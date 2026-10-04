@@ -7,6 +7,7 @@ import { useAuth } from '../auth'
 import type { SchematicDetail } from '../types'
 import MaterialTable from '../components/MaterialTable.vue'
 import Viewer3D from '../components/Viewer3D.vue'
+import BrandLoader from '../components/BrandLoader.vue'
 
 const props = defineProps<{ id: string }>()
 const { state, load } = useAuth()
@@ -83,8 +84,8 @@ function quotaHint(): string {
       <zhimo-button variant="secondary" @click="$router.push('/')">返回列表</zhimo-button>
     </div>
 
-    <div v-else-if="!detail" style="text-align: center; padding: 4rem">
-      <zhimo-spinner></zhimo-spinner>
+    <div v-else-if="!detail" class="page-loader">
+      <BrandLoader />
     </div>
 
     <template v-else>

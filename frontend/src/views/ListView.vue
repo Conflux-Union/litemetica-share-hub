@@ -6,6 +6,7 @@ import { boolAttr } from '../compat'
 import { useAuth } from '../auth'
 import type { ListResponse } from '../types'
 import SchematicCard from '../components/SchematicCard.vue'
+import BrandLoader from '../components/BrandLoader.vue'
 
 const { state, load } = useAuth()
 const result = ref<ListResponse | null>(null)
@@ -77,8 +78,8 @@ function next() {
       <zhimo-button variant="secondary" @click="fetchList">重试</zhimo-button>
     </div>
 
-    <div v-else-if="loading && !result" style="text-align: center; padding: 4rem">
-      <zhimo-spinner></zhimo-spinner>
+    <div v-else-if="loading && !result" class="page-loader">
+      <BrandLoader />
     </div>
 
     <div v-else-if="result && result.items.length === 0" class="auth-panel">

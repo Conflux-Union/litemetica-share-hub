@@ -6,11 +6,13 @@ import { api, ApiError } from '../api'
 import { loadAssets } from '../render/assets'
 import { decodePreview } from '../render/decode'
 import { extractSurface, type MeshData } from '../render/surface'
+import BrandLoader from './BrandLoader.vue'
 
 const props = defineProps<{ schematicId: string }>()
 
 const container = ref<HTMLDivElement>()
-const status = ref('加载中…')
+const loading = ref(true)
+const error = ref('')
 const faceCount = ref(0)
 
 let dispose: (() => void) | null = null
@@ -30,7 +32,8 @@ function rangeGeometry(mesh: MeshData, range: { start: number; count: number }):
 
 async function render() {
   if (!container.value) return
-  status.value = '加载中…'
+  loading.value = true
+  error.value = ''
   faceCount.value = 0
 
   const width = container.value.clientWidth
@@ -152,7 +155,7 @@ async function render() {
     attributeFilter: ['data-theme'],
   })
 
-  status.value = ''
+  loading.value = false
   dispose = () => {
     cancelAnimationFrame(raf)
     ro.disconnect()
@@ -172,7 +175,7 @@ onMounted(async () => {
   try {
     await render()
   } catch (e) {
-    status.value = e instanceof Error ? e.message : '预览渲染失败'
+    error.value = e instanceof Error ? e.message : '预览渲染失败'
   }
 })
 
@@ -184,7 +187,7 @@ watch(
     try {
       await render()
     } catch (e) {
-      status.value = e instanceof Error ? e.message : '预览渲染失败'
+      error.value = e instanceof Error ? e.message : '预览渲染失败'
     }
   },
 )
@@ -198,10 +201,28 @@ onBeforeUnmount(() => {
 <template>
   <div class="viewer-shell">
     <div ref="container" style="width: 100%; height: 100%"></div>
-    <div v-if="status" class="viewer-tip" style="left: 50%; transform: translateX(-50%)">
-      <zhimo-spinner v-if="status === '加载中…'" style="vertical-align: -3px" />
-      {{ status }}
+    <div v-if="loading" class="viewer-overlay">
+      <BrandLoader />
     </div>
+    <div v-else-if="error" class="viewer-overlay viewer-error">{{ error }}</div>
     <div v-else class="viewer-tip">拖拽旋转 · 滚轮缩放 · 右键平移</div>
   </div>
 </template>
+
+<style scoped>
+/* Centered states over the viewer canvas: brand loader while fetching,
+   error message on failure. Semi-opaque paper veil covers re-renders. */
+.viewer-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--zhimo-bg, #faf7f0) 72%, transparent);
+}
+
+.viewer-error {
+  color: var(--zhimo-danger, #9e2f1c);
+  font-size: 0.95rem;
+}
+</style>

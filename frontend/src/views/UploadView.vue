@@ -5,6 +5,7 @@ import { api, ApiError } from '../api'
 import { boolAttr } from '../compat'
 import { useAuth } from '../auth'
 import FileDrop from '../components/FileDrop.vue'
+import BrandLoader from '../components/BrandLoader.vue'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
@@ -36,8 +37,8 @@ async function submit() {
 
 <template>
   <div class="page" style="max-width: 640px">
-    <div v-if="!state.loaded" style="text-align: center; padding: 4rem">
-      <zhimo-spinner></zhimo-spinner>
+    <div v-if="!state.loaded" class="page-loader">
+      <BrandLoader />
     </div>
 
     <div v-else-if="!state.user" class="auth-panel">
