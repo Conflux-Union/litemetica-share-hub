@@ -190,8 +190,22 @@ fn build_bundle(jar_bytes: &[u8], data_dir: &Path, version: &str) -> Result<(), 
     // real block models from the entity textures, with facing/type variants,
     // and crop the 64x64 entity layouts into per-face atlas tiles.
     let mut derived_tiles: HashMap<String, image::RgbaImage> = HashMap::new();
-    let chest_families = synthesize_chests(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
-    println!("synthesized chest models for {chest_families} families ({} derived tiles)", derived_tiles.len());
+    let mut families = synthesize_chests(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    // 2.6. The other block-entity families get the same treatment, and the
+    // bare face-texture refs of shipped models (heavy_core) are normalized.
+    families += synthesize_shulker_boxes(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_banners(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_heads(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_golem_statues(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_conduits(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_decorated_pots(&mut block_states, &mut raw_models, &mut archive, &mut derived_tiles);
+    families += synthesize_end_portals(&mut block_states, &mut raw_models);
+    families += synthesize_lava(&mut block_states, &mut raw_models);
+    let fixed_refs = normalize_face_texture_refs(&mut raw_models);
+    println!(
+        "synthesized models for {families} blockstate families ({} derived tiles), normalized {fixed_refs} bare face texture refs",
+        derived_tiles.len()
+    );
 
     // 3. Keep only models reachable from any blockstate via parent chains.
     let seeds: Vec<String> = block_states
@@ -605,6 +619,931 @@ fn synthesize_chests(
         count += 1;
     }
     count
+}
+
+// ---- Entity-rendered block synthesis: shared machinery ---------------------
+//
+// The same treatment chests get, generalized for the other block-entity
+// families (shulker boxes, banners, heads, golem statues, conduits, decorated
+// pots). Each family synthesizes real block models from its entity textures
+// via the generic entity-box layout (box_face_rects, up/down slots NOT
+// swapped — pixel-verified: the shulker lid's outer top face is the first
+// slot (u+d, v) with fill 1.00 while the second slot holds the mostly
+// transparent interior view; the chest swap is a chest-only quirk).
+
+/// One entity-model box placed in the block. `w`/`h`/`d` are the entity box
+/// dimensions at texOffs (`u`, `v`); `from`/`to` are block-model space
+/// (0..16); `tint` multiplies the cropped pixels (dyed banner cloth);
+/// `rotation` is an optional element rotation (piglin ears); `skip` omits
+/// faces (decorated-pot neck top, coplanar with the shoulder plane).
+struct BoxSpec {
+    prefix: String,
+    part: String,
+    from: [f64; 3],
+    to: [f64; 3],
+    w: u32,
+    h: u32,
+    d: u32,
+    u: u32,
+    v: u32,
+    tint: Option<[u8; 3]>,
+    rotation: Option<Value>,
+    skip: Vec<&'static str>,
+}
+
+fn box_spec(
+    prefix: &str,
+    part: &str,
+    from: [f64; 3],
+    to: [f64; 3],
+    w: u32,
+    h: u32,
+    d: u32,
+    u: u32,
+    v: u32,
+) -> BoxSpec {
+    BoxSpec {
+        prefix: prefix.into(),
+        part: part.into(),
+        from,
+        to,
+        w,
+        h,
+        d,
+        u,
+        v,
+        tint: None,
+        rotation: None,
+        skip: Vec::new(),
+    }
+}
+
+impl BoxSpec {
+    fn tinted(mut self, rgb: [u8; 3]) -> BoxSpec {
+        self.tint = Some(rgb);
+        self
+    }
+
+    fn rotated(mut self, origin: [f64; 3], axis: &str, angle: f64) -> BoxSpec {
+        self.rotation = Some(json!({ "origin": origin, "axis": axis, "angle": angle }));
+        self
+    }
+
+    fn skipping(mut self, faces: &[&'static str]) -> BoxSpec {
+        self.skip = faces.to_vec();
+        self
+    }
+}
+
+/// The cull direction when this element face lies exactly on the block
+/// boundary (vanilla models cull flush faces, e.g. cube_all); interior faces
+/// stay uncullable.
+fn flush_cullface(dir: &str, from: &[f64; 3], to: &[f64; 3]) -> Option<&'static str> {
+    let on = |v: f64, t: f64| (v - t).abs() < 1e-9;
+    Some(match dir {
+        "north" if on(from[2], 0.0) => "north",
+        "south" if on(to[2], 16.0) => "south",
+        "west" if on(from[0], 0.0) => "west",
+        "east" if on(to[0], 16.0) => "east",
+        "up" if on(to[1], 16.0) => "up",
+        "down" if on(from[1], 0.0) => "down",
+        _ => return None,
+    })
+}
+
+/// Crop a face region into its own 16x16 transparent-padded atlas tile,
+/// scaling down when the region exceeds the tile (banner flag faces are
+/// 20x40 entity texels; nearest-neighbor keeps the pixel look). `flip`
+/// mirrors east-west, `tint` multiplies the RGB channels. Returns the tile
+/// plus the content size the face uv must use.
+fn crop_tile_scaled(
+    src: &image::RgbaImage,
+    r: Rect,
+    flip: bool,
+    tint: Option<[u8; 3]>,
+) -> (image::RgbaImage, u32, u32) {
+    let mut region = image::imageops::crop_imm(src, r.x, r.y, r.w, r.h).to_image();
+    if flip {
+        region = image::imageops::flip_horizontal(&region);
+    }
+    if let Some(rgb) = tint {
+        for p in region.pixels_mut() {
+            for c in 0..3 {
+                p.0[c] = ((p.0[c] as u16 * rgb[c] as u16 + 127) / 255) as u8;
+            }
+        }
+    }
+    let (cw, ch) = if r.w <= TILE && r.h <= TILE {
+        (r.w, r.h)
+    } else {
+        let s = TILE as f64 / r.w.max(r.h) as f64;
+        let tw = ((r.w as f64 * s).round() as u32).clamp(1, TILE);
+        let th = ((r.h as f64 * s).round() as u32).clamp(1, TILE);
+        region = image::imageops::resize(&region, tw, th, image::imageops::FilterType::Nearest);
+        (tw, th)
+    };
+    let mut tile = image::RgbaImage::new(TILE, TILE);
+    image::imageops::overlay(&mut tile, &region, 0, 0);
+    (tile, cw, ch)
+}
+
+/// One entity box as a model element with per-face derived tiles. The
+/// generic entity layout is used as-is (no chest up/down swap). North/south
+/// tiles are cropped mirrored: entity boxes run side-face u west-to-east
+/// while block models run it east-to-west (see crop_tile), so the flip keeps
+/// the art unmirrored — imperceptible for the symmetric families here, but
+/// consistent with the double-chest seam verification.
+fn entity_box_element(
+    src: &image::RgbaImage,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+    spec: &BoxSpec,
+) -> (Value, Map<String, Value>) {
+    let rects = box_face_rects(spec.w, spec.h, spec.d, spec.u, spec.v);
+    let dirs = ["up", "down", "north", "south", "west", "east"];
+    let mut faces = Map::new();
+    let mut textures = Map::new();
+    for (i, dir) in dirs.iter().enumerate() {
+        if spec.skip.contains(dir) {
+            continue;
+        }
+        let r = rects[i];
+        let key = format!("{}_{}", spec.part, dir);
+        let tile_id = format!("{}__{}", spec.prefix, key);
+        let flip = matches!(*dir, "north" | "south");
+        let (tile, cw, ch) = crop_tile_scaled(src, r, flip, spec.tint);
+        derived_tiles.entry(tile_id.clone()).or_insert(tile);
+        textures.insert(key.clone(), json!(tile_id));
+        let mut face = Map::new();
+        face.insert("texture".into(), json!(format!("#{key}")));
+        face.insert("uv".into(), json!([0, 0, cw, ch]));
+        if let Some(cull) = flush_cullface(*dir, &spec.from, &spec.to) {
+            face.insert("cullface".into(), json!(cull));
+        }
+        faces.insert(dir.to_string(), Value::Object(face));
+    }
+    let mut element = Map::new();
+    element.insert("from".into(), json!(spec.from));
+    element.insert("to".into(), json!(spec.to));
+    if let Some(rot) = &spec.rotation {
+        element.insert("rotation".into(), rot.clone());
+    }
+    element.insert("faces".into(), Value::Object(faces));
+    (Value::Object(element), textures)
+}
+
+/// A model assembled from entity boxes over one texture.
+fn entity_box_model(
+    src: &image::RgbaImage,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+    specs: &[BoxSpec],
+    particle: &str,
+) -> Value {
+    let mut elements = Vec::new();
+    let mut textures = Map::new();
+    for spec in specs {
+        let (element, tex) = entity_box_element(src, derived_tiles, spec);
+        elements.push(element);
+        for (k, v) in tex {
+            textures.insert(k, v);
+        }
+    }
+    textures.insert("particle".into(), json!(particle));
+    json!({ "textures": textures, "elements": elements })
+}
+
+/// An entity texture under assets/minecraft/textures/, decoded to RGBA.
+fn load_entity_texture(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    path: &str,
+) -> Option<image::RgbaImage> {
+    let bytes = read_zip_file(archive, &format!("assets/minecraft/textures/{path}.png"))?;
+    image::load_from_memory(&bytes).ok().map(|img| img.to_rgba8())
+}
+
+/// "" plus the four horizontal facings as y quarter turns (golem statues,
+/// wall banners, wall heads): the y0 model faces north.
+fn variants_empty_and_facing(model_id: &str) -> Map<String, Value> {
+    let mut variants = Map::new();
+    variants.insert("".into(), json!({ "model": model_id }));
+    for (facing, y) in [("north", 0), ("east", 90), ("south", 180), ("west", 270)] {
+        variants.insert(format!("facing={facing}"), json!({ "model": model_id, "y": y }));
+    }
+    variants
+}
+
+/// Rotate a model-space point around a vertical axis through `origin` by
+/// `deg` degrees, using exactly the frontend's element-rotation formula
+/// (geometry.ts rotateAroundAxis, right-hand rule).
+fn rotate_y_about(p: [f64; 3], origin: [f64; 3], deg: f64) -> [f64; 3] {
+    if deg == 0.0 {
+        return p;
+    }
+    let rad = deg.to_radians();
+    let (s, c) = (rad.sin(), rad.cos());
+    let (x, z) = (p[0] - origin[0], p[2] - origin[2]);
+    [x * c + z * s + origin[0], p[1], -x * s + z * c + origin[2]]
+}
+
+/// Add a y-axis element rotation to every element of a model copy: banner
+/// and floor-head `rotation` properties step 22.5°, finer than the variant
+/// table's quarter turns, so the residual angle is baked per element (the
+/// variant table carries the coarse quarter turn; both rotate about the
+/// same vertical axis through x=8, z=8, so they compose additively).
+/// Elements that already rotate (piglin ears) keep their own rotation and
+/// only have their box and pivot moved along — the plate stays
+/// axis-aligned, a bounded approximation for rotated piglin heads.
+fn bake_y_rotation(model: &Value, deg: f64) -> Value {
+    let mut out = model.clone();
+    let Some(elements) = out.get_mut("elements").and_then(|e| e.as_array_mut()) else {
+        return out;
+    };
+    for el in elements.iter_mut() {
+        let arr = |key: &str| -> Option<[f64; 3]> {
+            let v = el.get(key)?.as_array()?;
+            Some([
+                v.first()?.as_f64()?,
+                v.get(1)?.as_f64()?,
+                v.get(2)?.as_f64()?,
+            ])
+        };
+        let (Some(from), Some(to)) = (arr("from"), arr("to")) else {
+            continue;
+        };
+        let axis: [f64; 3] = [8.0, 0.0, 8.0];
+        let already = el
+            .get("rotation")
+            .and_then(|r| r.get("angle"))
+            .and_then(|a| a.as_f64())
+            .is_some_and(|a| a != 0.0);
+        if already {
+            // Move the box (center rotated, extents kept) and its pivot;
+            // the single-axis element rotation cannot express the composed
+            // tilt, so the ear plate keeps its world-z tilt.
+            let center = [
+                (from[0] + to[0]) / 2.0,
+                (from[1] + to[1]) / 2.0,
+                (from[2] + to[2]) / 2.0,
+            ];
+            let moved = rotate_y_about(center, axis, deg);
+            let half = [(to[0] - from[0]) / 2.0, (to[1] - from[1]) / 2.0, (to[2] - from[2]) / 2.0];
+            el["from"] = json!([moved[0] - half[0], moved[1] - half[1], moved[2] - half[2]]);
+            el["to"] = json!([moved[0] + half[0], moved[1] + half[1], moved[2] + half[2]]);
+            if let Some(origin) = el
+                .get_mut("rotation")
+                .and_then(|r| r.get_mut("origin"))
+                .and_then(|o| o.as_array_mut())
+            {
+                let p = [
+                    origin.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    origin.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    origin.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                ];
+                let rp = rotate_y_about(p, axis, deg);
+                *origin = vec![json!(rp[0]), json!(rp[1]), json!(rp[2])];
+            }
+        } else {
+            el["rotation"] = json!({ "origin": [8.0, 0.0, 8.0], "axis": "y", "angle": deg });
+        }
+    }
+    out
+}
+
+/// Vanilla dye colors (DyeColor.textureDiffuseColor) used to tint the plain
+/// banner cloth; patterns come from NBT and are approximated away.
+const DYE_COLORS: [(&str, [u8; 3]); 16] = [
+    ("white", [0xF9, 0xFF, 0xFE]),
+    ("orange", [0xF9, 0x80, 0x1D]),
+    ("magenta", [0xC7, 0x4E, 0xBD]),
+    ("light_blue", [0x3A, 0xB3, 0xDA]),
+    ("yellow", [0xFE, 0xD8, 0x3D]),
+    ("lime", [0x80, 0xC7, 0x1F]),
+    ("pink", [0xF3, 0x8B, 0xAA]),
+    ("gray", [0x47, 0x4F, 0x52]),
+    ("light_gray", [0x9D, 0x9D, 0x97]),
+    ("cyan", [0x16, 0x9C, 0x9C]),
+    ("purple", [0x89, 0x32, 0xB8]),
+    ("blue", [0x3C, 0x44, 0xAA]),
+    ("brown", [0x83, 0x54, 0x32]),
+    ("green", [0x5E, 0x7C, 0x16]),
+    ("red", [0xB0, 0x2E, 0x26]),
+    ("black", [0x1D, 0x1D, 0x21]),
+];
+
+// ---- Shulker boxes -----------------------------------------------------------
+
+fn shulker_texture_stem(block_id: &str) -> Option<String> {
+    let name = block_id.strip_prefix("minecraft:block/")?;
+    if name == "shulker_box" {
+        Some("shulker".into())
+    } else {
+        name.strip_suffix("_shulker_box").map(|c| format!("shulker_{c}"))
+    }
+}
+
+/// Shulker boxes are block entities whose 26.3 blockstate only has the ""
+/// variant. Synthesize the closed box (base y0..8, lid a tall cup y4..16
+/// overlapping the base's top band) from the 64x64 entity texture and
+/// rebuild the variant table with the six facings. The overlap band's side
+/// textures are complementary cutouts — pixel-verified: 0 of 64 band pixels
+/// are opaque in both the lid and base rows on every side face — so the
+/// coplanar walls cannot z-fight and no epsilon inset is needed.
+fn synthesize_shulker_boxes(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let keys: Vec<String> = block_states
+        .keys()
+        .filter(|k| shulker_texture_stem(k).is_some())
+        .cloned()
+        .collect();
+    let mut count = 0;
+    for state_key in keys {
+        let stem = shulker_texture_stem(&state_key).unwrap();
+        let Some(src) = load_entity_texture(archive, &format!("entity/shulker/{stem}")) else {
+            eprintln!("[shulker] entity/shulker/{stem}.png missing; {state_key} keeps placeholder");
+            continue;
+        };
+        let block_name = state_key.trim_start_matches("minecraft:block/").to_string();
+        let tile_prefix = format!("minecraft:entity/shulker/{stem}");
+        let model_id = format!("minecraft:block/{block_name}_synthetic");
+        let model = entity_box_model(
+            &src,
+            derived_tiles,
+            &[
+                box_spec(&tile_prefix, "base", [0.0, 0.0, 0.0], [16.0, 8.0, 16.0], 16, 8, 16, 0, 28),
+                box_spec(&tile_prefix, "lid", [0.0, 4.0, 0.0], [16.0, 16.0, 16.0], 16, 12, 16, 0, 0),
+            ],
+            "#lid_up",
+        );
+        raw_models.insert(model_id.clone(), model);
+        // The model is built lid-up (facing=up); sideways facings tip the
+        // box over — x90 first, then the y quarter turn, the same
+        // convention as the chest table (x90 maps up to north).
+        let mut variants = Map::new();
+        let table = [
+            ("", None, 0i32),
+            ("facing=up", None, 0),
+            ("facing=down", Some(180), 0),
+            ("facing=north", Some(90), 0),
+            ("facing=east", Some(90), 90),
+            ("facing=south", Some(90), 180),
+            ("facing=west", Some(90), 270),
+        ];
+        for (key, x, y) in table {
+            let mut entry = Map::new();
+            entry.insert("model".into(), json!(model_id));
+            if let Some(x) = x {
+                entry.insert("x".into(), json!(x));
+            }
+            if y != 0 {
+                entry.insert("y".into(), json!(y));
+            }
+            variants.insert(key.into(), Value::Object(entry));
+        }
+        block_states.insert(state_key, json!({ "variants": variants }));
+        count += 1;
+    }
+    count
+}
+
+// ---- Banners ------------------------------------------------------------------
+
+/// Banners: standing (pole + crossbar + cloth) and wall (crossbar + cloth)
+/// forms from entity/banner/banner_base.png. Only the undecorated cloth is
+/// synthesized — patterns are NBT-driven and approximated away; the cloth
+/// (white in the texture, mean 241,241,241) is multiplied by the vanilla
+/// dye color while the wooden pole/bar keep their texture pixels. Banner
+/// geometry is taller than one block (pole to y28, cloth y2.67..29.33;
+/// wall cloth hangs to y-13) — faithful to the 26.3 entity model, whose
+/// transform chain (translate(0.5,0,0.5) + scale(2/3,-2/3,-2/3)) these
+/// coordinates fold down. Floor `rotation=0..15` steps 22.5°, finer than
+/// quarter turns: the residual (r mod 4) is baked as an element rotation
+/// and the coarse quarter turn rides on the variant's y.
+fn synthesize_banners(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let Some(base) = load_entity_texture(archive, "entity/banner/banner_base") else {
+        eprintln!("[banner] banner_base.png missing; banners keep placeholders");
+        return 0;
+    };
+    let wood_prefix = "minecraft:entity/banner/wood";
+    let mut count = 0;
+    for (color, rgb) in DYE_COLORS {
+        let cloth_prefix = format!("minecraft:entity/banner/{color}");
+        let block = format!("{color}_banner");
+        let wall_block = format!("{color}_wall_banner");
+
+        // Standing: pole x/z 7.33..8.67 y0..28, crossbar y28..29.33, cloth
+        // hanging the full pole length just south of it.
+        let standing_specs = vec![
+            box_spec(wood_prefix, "pole", [7.33, 0.0, 7.33], [8.67, 28.0, 8.67], 2, 42, 2, 44, 0),
+            box_spec(wood_prefix, "bar", [1.33, 28.0, 7.33], [14.67, 29.33, 8.67], 20, 2, 2, 0, 42),
+            box_spec(&cloth_prefix, "flag", [1.33, 2.67, 8.67], [14.67, 29.33, 9.33], 20, 40, 1, 0, 0)
+                .tinted(rgb),
+        ];
+        let standing_id = format!("minecraft:block/{block}_synthetic");
+        let standing = entity_box_model(&base, derived_tiles, &standing_specs, "#flag_north");
+        raw_models.insert(standing_id.clone(), standing.clone());
+        let mut residual_models = vec![standing_id.clone()];
+        for s in 1..4u32 {
+            let baked = bake_y_rotation(&standing, -(s as f64) * 22.5);
+            let id = format!("{standing_id}_r{s}");
+            raw_models.insert(id.clone(), baked);
+            residual_models.push(id);
+        }
+        let mut variants = Map::new();
+        for r in 0..16u32 {
+            let mut entry = Map::new();
+            entry.insert("model".into(), json!(residual_models[(r % 4) as usize]));
+            if r / 4 > 0 {
+                entry.insert("y".into(), json!(90 * (r / 4)));
+            }
+            variants.insert(format!("rotation={r}"), Value::Object(entry));
+        }
+        block_states.insert(
+            format!("minecraft:block/{block}"),
+            json!({ "variants": variants }),
+        );
+
+        // Wall (facing=north base geometry): crossbar flush under the block
+        // top against the wall, cloth hanging past the block bottom.
+        let wall_specs = vec![
+            box_spec(wood_prefix, "bar", [1.33, 13.67, 14.5], [14.67, 15.17, 16.0], 20, 2, 2, 0, 42),
+            box_spec(&cloth_prefix, "flag", [1.33, -13.0, 13.67], [14.67, 13.67, 14.33], 20, 40, 1, 0, 0)
+                .tinted(rgb),
+        ];
+        let wall_id = format!("minecraft:block/{wall_block}_synthetic");
+        raw_models.insert(wall_id.clone(), entity_box_model(&base, derived_tiles, &wall_specs, "#flag_north"));
+        let mut wall_variants = Map::new();
+        for (facing, y) in [("north", 0), ("east", 90), ("south", 180), ("west", 270)] {
+            wall_variants.insert(format!("facing={facing}"), json!({ "model": wall_id, "y": y }));
+        }
+        block_states.insert(
+            format!("minecraft:block/{wall_block}"),
+            json!({ "variants": wall_variants }),
+        );
+        count += 2;
+    }
+    count
+}
+
+// ---- Heads --------------------------------------------------------------------
+
+/// (floor block, wall block, entity texture stem). Player heads use the
+/// default skin (custom skins are NBT/UUID-driven and approximated away).
+/// No hat box is synthesized: pixel-verified, the 8x8x8 hat slot at
+/// texOffs (32,0) is empty in the four mob-skull skins and the default
+/// player skin except one near-transparent creeper pixel (32,11, alpha 8)
+/// that cutout classification drops anyway; piglin/dragon use whole-mob
+/// textures whose (32,0) area belongs to other body parts, unsampled here.
+const HEAD_KINDS: [(&str, &str, &str); 7] = [
+    ("creeper_head", "creeper_wall_head", "creeper/creeper"),
+    ("skeleton_skull", "skeleton_wall_skull", "skeleton/skeleton"),
+    ("wither_skeleton_skull", "wither_skeleton_wall_skull", "skeleton/wither_skeleton"),
+    ("zombie_head", "zombie_wall_head", "zombie/zombie"),
+    ("player_head", "player_wall_head", "player/slim/steve"),
+    ("piglin_head", "piglin_wall_head", "piglin/piglin"),
+    ("dragon_head", "dragon_wall_head", "enderdragon/dragon"),
+];
+
+/// Entity boxes of one head kind in floor position (face north, box on the
+/// ground, centered): an 8x8x8 head for the mob-skull shapes, piglin's
+/// snout/tusks/ears, or the dragon's 0.75-scaled head stack (texOffs all
+/// pixel-verified; the dragon's world placement is the classic block-skull
+/// arrangement — head box centered, lip/jaw protruding north past the block
+/// edge, mouth closed).
+fn head_box_specs(prefix: &str) -> Vec<BoxSpec> {
+    let simple = |prefix: &str| {
+        vec![box_spec(prefix, "head", [4.0, 0.0, 4.0], [12.0, 8.0, 12.0], 8, 8, 8, 0, 0)]
+    };
+    let piglin = |prefix: &str| {
+        vec![
+            box_spec(prefix, "skull", [3.0, 0.0, 4.0], [13.0, 8.0, 12.0], 10, 8, 8, 0, 0),
+            box_spec(prefix, "snout", [6.0, 1.0, 3.0], [10.0, 5.0, 4.0], 4, 4, 1, 31, 1),
+            box_spec(prefix, "tusk_left", [5.0, 0.0, 3.0], [6.0, 2.0, 4.0], 1, 2, 1, 2, 4),
+            box_spec(prefix, "tusk_right", [10.0, 0.0, 3.0], [11.0, 2.0, 4.0], 1, 2, 1, 2, 0),
+            box_spec(prefix, "ear_left", [2.0, 3.0, 4.0], [3.0, 8.0, 8.0], 1, 5, 4, 51, 6)
+                .rotated([2.5, 3.0, 6.0], "z", 30.0),
+            box_spec(prefix, "ear_right", [13.0, 3.0, 4.0], [14.0, 8.0, 8.0], 1, 5, 4, 39, 6)
+                .rotated([13.5, 3.0, 6.0], "z", -30.0),
+        ]
+    };
+    let dragon = |prefix: &str| {
+        vec![
+            box_spec(prefix, "upper_head", [2.0, 0.0, 2.0], [14.0, 12.0, 14.0], 16, 16, 16, 112, 30),
+            box_spec(prefix, "upper_lip", [3.5, 4.0, -6.0], [12.5, 7.75, 6.0], 12, 5, 16, 176, 44),
+            box_spec(prefix, "jaw", [3.5, 1.0, -6.0], [12.5, 4.0, 6.0], 12, 4, 16, 176, 65),
+            box_spec(prefix, "scale_left", [0.5, 7.0, 8.0], [2.0, 10.0, 12.5], 2, 4, 6, 0, 0),
+            box_spec(prefix, "scale_right", [14.0, 7.0, 8.0], [15.5, 10.0, 12.5], 2, 4, 6, 0, 0),
+            box_spec(prefix, "nostril_left", [5.0, 7.75, -3.0], [6.5, 9.25, 0.0], 2, 2, 4, 112, 0),
+            box_spec(prefix, "nostril_right", [9.5, 7.75, -3.0], [11.0, 9.25, 0.0], 2, 2, 4, 112, 0),
+        ]
+    };
+    match prefix.rsplit('/').next().unwrap_or("") {
+        "piglin" => piglin(prefix),
+        "dragon" => dragon(prefix),
+        _ => simple(prefix),
+    }
+}
+
+/// Shift a spec list by a block-space offset (wall heads move +y4 so the
+/// box sits y4..12 and hug the wall side).
+fn shift_specs(specs: Vec<BoxSpec>, by: [f64; 3]) -> Vec<BoxSpec> {
+    specs
+        .into_iter()
+        .map(|mut s| {
+            for i in 0..3 {
+                s.from[i] += by[i];
+                s.to[i] += by[i];
+            }
+            if let Some(rot) = &mut s.rotation {
+                if let Some(origin) = rot.get_mut("origin").and_then(|o| o.as_array_mut()) {
+                    for (i, v) in origin.iter_mut().enumerate() {
+                        if let Some(n) = v.as_f64() {
+                            *v = json!(n + by[i]);
+                        }
+                    }
+                }
+            }
+            s
+        })
+        .collect()
+}
+
+/// Skulls and heads: floor blocks carry rotation=0..15 (22.5° steps baked
+/// like banners), wall blocks carry facing. The y0 model faces north.
+fn synthesize_heads(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let mut count = 0;
+    for (floor_block, wall_block, tex) in HEAD_KINDS {
+        let Some(src) = load_entity_texture(archive, &format!("entity/{tex}")) else {
+            eprintln!("[head] entity/{tex}.png missing; {floor_block} keeps placeholder");
+            continue;
+        };
+        let tile_prefix = format!("minecraft:entity/{tex}");
+        let first_part = head_box_specs(&tile_prefix)[0].part.clone();
+
+        let floor_specs = head_box_specs(&tile_prefix);
+        let floor_id = format!("minecraft:block/{floor_block}_synthetic");
+        let floor = entity_box_model(&src, derived_tiles, &floor_specs, &format!("#{first_part}_north"));
+        raw_models.insert(floor_id.clone(), floor.clone());
+        let mut residual_models = vec![floor_id.clone()];
+        for s in 1..4u32 {
+            let id = format!("{floor_id}_r{s}");
+            raw_models.insert(id.clone(), bake_y_rotation(&floor, -(s as f64) * 22.5));
+            residual_models.push(id);
+        }
+        let mut variants = Map::new();
+        for r in 0..16u32 {
+            let mut entry = Map::new();
+            entry.insert("model".into(), json!(residual_models[(r % 4) as usize]));
+            if r / 4 > 0 {
+                entry.insert("y".into(), json!(90 * (r / 4)));
+            }
+            variants.insert(format!("rotation={r}"), Value::Object(entry));
+        }
+        block_states.insert(
+            format!("minecraft:block/{floor_block}"),
+            json!({ "variants": variants }),
+        );
+
+        // Wall heads: same boxes shifted +y4/+z4 — the simple head then
+        // spans y4..12 and z8..16, hugging the wall block to the south.
+        let wall_specs = shift_specs(head_box_specs(&tile_prefix), [0.0, 4.0, 4.0]);
+        let wall_id = format!("minecraft:block/{wall_block}_synthetic");
+        raw_models.insert(
+            wall_id.clone(),
+            entity_box_model(&src, derived_tiles, &wall_specs, &format!("#{first_part}_north")),
+        );
+        block_states.insert(
+            format!("minecraft:block/{wall_block}"),
+            json!({ "variants": variants_empty_and_facing(&wall_id) }),
+        );
+        count += 2;
+    }
+    count
+}
+
+// ---- Copper golem statues -------------------------------------------------------
+
+fn golem_texture_stem(block_id: &str) -> Option<&'static str> {
+    let name = block_id.strip_prefix("minecraft:block/")?;
+    let bare = name.strip_prefix("waxed_").unwrap_or(name);
+    Some(match bare {
+        "copper_golem_statue" => "copper_golem",
+        "exposed_copper_golem_statue" => "copper_golem_exposed",
+        "weathered_copper_golem_statue" => "copper_golem_weathered",
+        "oxidized_copper_golem_statue" => "copper_golem_oxidized",
+        _ => return None,
+    })
+}
+
+/// Copper golem statues (standing pose; POSE variants and the glowing eyes
+/// layer are approximated away). All nine box texOffs pixel-verified at
+/// fill 1.00; the y0 model faces north (nose at low z), total height 24px
+/// with the antenna ball poking past the block top — the vanilla silhouette.
+fn synthesize_golem_statues(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let keys: Vec<String> = block_states
+        .keys()
+        .filter(|k| golem_texture_stem(k).is_some())
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return 0;
+    }
+    // One model per oxidation texture; waxed blockstates share them (their
+    // vanilla blockstates also point at the unwaxed model ids).
+    let mut models: HashMap<&'static str, String> = HashMap::new();
+    for stem in ["copper_golem", "copper_golem_exposed", "copper_golem_weathered", "copper_golem_oxidized"] {
+        let Some(src) = load_entity_texture(archive, &format!("entity/copper_golem/{stem}")) else {
+            eprintln!("[golem] entity/copper_golem/{stem}.png missing");
+            continue;
+        };
+        let tile_prefix = format!("minecraft:entity/copper_golem/{stem}");
+        let specs = vec![
+            box_spec(&tile_prefix, "leg_left", [4.0, 0.0, 6.0], [8.0, 5.0, 10.0], 4, 5, 4, 0, 27),
+            box_spec(&tile_prefix, "leg_right", [8.0, 0.0, 6.0], [12.0, 5.0, 10.0], 4, 5, 4, 16, 27),
+            box_spec(&tile_prefix, "body", [4.0, 5.0, 5.0], [12.0, 11.0, 11.0], 8, 6, 6, 0, 15),
+            box_spec(&tile_prefix, "arm_left", [1.0, 6.0, 6.0], [4.0, 16.0, 10.0], 3, 10, 4, 36, 16),
+            box_spec(&tile_prefix, "arm_right", [12.0, 6.0, 6.0], [15.0, 16.0, 10.0], 3, 10, 4, 50, 16),
+            box_spec(&tile_prefix, "skull", [4.0, 11.0, 3.0], [12.0, 16.0, 13.0], 8, 5, 10, 0, 0),
+            box_spec(&tile_prefix, "nose", [7.0, 12.0, 2.0], [9.0, 15.0, 4.0], 2, 3, 2, 56, 0),
+            box_spec(&tile_prefix, "antenna_stalk", [7.0, 16.0, 7.0], [9.0, 20.0, 9.0], 2, 4, 2, 37, 8),
+            box_spec(&tile_prefix, "antenna_block", [6.0, 20.0, 6.0], [10.0, 24.0, 10.0], 4, 4, 4, 37, 0),
+        ];
+        let model_id = format!("minecraft:block/{stem}_statue_synthetic");
+        raw_models.insert(
+            model_id.clone(),
+            entity_box_model(&src, derived_tiles, &specs, "#skull_north"),
+        );
+        models.insert(stem, model_id);
+    }
+    let mut count = 0;
+    for state_key in keys {
+        let stem = golem_texture_stem(&state_key).unwrap();
+        let Some(model_id) = models.get(stem) else { continue };
+        block_states.insert(
+            state_key,
+            json!({ "variants": variants_empty_and_facing(model_id) }),
+        );
+        count += 1;
+    }
+    count
+}
+
+// ---- Conduits -------------------------------------------------------------------
+
+/// Conduit: heart shell (6x6x6 from entity/conduit/base.png) inside the
+/// open cage (8x8x8 from entity/conduit/cage.png — the cage texture is a
+/// verified cutout lattice, alpha-classified automatically). The billboard
+/// eye and the spinning wind wall are animated and approximated away.
+fn synthesize_conduits(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let state_key = "minecraft:block/conduit";
+    if !block_states.contains_key(state_key) {
+        return 0;
+    }
+    let (Some(shell_src), Some(cage_src)) = (
+        load_entity_texture(archive, "entity/conduit/base"),
+        load_entity_texture(archive, "entity/conduit/cage"),
+    ) else {
+        eprintln!("[conduit] conduit textures missing; keeps placeholder");
+        return 0;
+    };
+    let mut elements = Vec::new();
+    let mut textures = Map::new();
+    for (src, spec) in [
+        (
+            &shell_src,
+            box_spec("minecraft:entity/conduit/base", "shell", [5.0, 5.0, 5.0], [11.0, 11.0, 11.0], 6, 6, 6, 0, 0),
+        ),
+        (
+            &cage_src,
+            box_spec("minecraft:entity/conduit/cage", "cage", [4.0, 4.0, 4.0], [12.0, 12.0, 12.0], 8, 8, 8, 0, 0),
+        ),
+    ] {
+        let (element, tex) = entity_box_element(src, derived_tiles, &spec);
+        elements.push(element);
+        for (k, v) in tex {
+            textures.insert(k, v);
+        }
+    }
+    textures.insert("particle".into(), json!("#shell_north"));
+    let model_id = "minecraft:block/conduit_synthetic";
+    raw_models.insert(model_id.into(), json!({ "textures": textures, "elements": elements }));
+    block_states.insert(state_key.into(), json!({ "variants": { "": { "model": model_id } } }));
+    1
+}
+
+// ---- Decorated pots ---------------------------------------------------------------
+
+/// Decorated pot: four one-faced wall planes (14x16 from the side texture,
+/// rect (1,0,14,16) pixel-verified), shoulder/base planes (14x14 from the
+/// base texture rects (0,13) and (14,13)), and the neck collar (8x3x8,
+/// top face skipped — coplanar with the shoulder). Sherds are NBT-driven;
+/// plain pots are approximated as the undecorated sides (all four walls
+/// sample the same texture).
+fn synthesize_decorated_pots(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    derived_tiles: &mut HashMap<String, image::RgbaImage>,
+) -> usize {
+    let state_key = "minecraft:block/decorated_pot";
+    if !block_states.contains_key(state_key) {
+        return 0;
+    }
+    let (Some(base_src), Some(side_src)) = (
+        load_entity_texture(archive, "entity/decorated_pot/decorated_pot_base"),
+        load_entity_texture(archive, "entity/decorated_pot/decorated_pot_side"),
+    ) else {
+        eprintln!("[pot] decorated pot textures missing; keeps placeholder");
+        return 0;
+    };
+    let base_prefix = "minecraft:entity/decorated_pot/base";
+    let side_prefix = "minecraft:entity/decorated_pot/side";
+
+    let mut elements = Vec::new();
+    let mut textures = Map::new();
+
+    // One wall plane per side: only the outward-facing face is declared,
+    // with an explicit uv (zero-thickness faces get degenerate auto-UVs).
+    let walls = [
+        ("north", [1.0, 0.0, 1.0], [15.0, 16.0, 1.0]),
+        ("south", [1.0, 0.0, 15.0], [15.0, 16.0, 15.0]),
+        ("west", [1.0, 0.0, 1.0], [1.0, 16.0, 15.0]),
+        ("east", [15.0, 0.0, 1.0], [15.0, 16.0, 15.0]),
+    ];
+    for (dir, from, to) in walls {
+        let tile_id = format!("{side_prefix}__{dir}");
+        let r = Rect { x: 1, y: 0, w: 14, h: 16 };
+        derived_tiles
+            .entry(tile_id.clone())
+            .or_insert_with(|| crop_tile_scaled(&side_src, r, false, None).0);
+        textures.insert(dir.to_string(), json!(tile_id));
+        elements.push(json!({
+            "from": from, "to": to,
+            "faces": { dir: { "texture": format!("#{dir}"), "uv": [0, 0, 14, 16] } },
+        }));
+    }
+
+    // Shoulder (up) and base (down) planes from the base texture.
+    let planes = [
+        ("up", [1.0, 16.0, 1.0], [15.0, 16.0, 15.0], Rect { x: 0, y: 13, w: 14, h: 14 }),
+        ("down", [1.0, 0.0, 1.0], [15.0, 0.0, 15.0], Rect { x: 14, y: 13, w: 14, h: 14 }),
+    ];
+    for (dir, from, to, r) in planes {
+        let tile_id = format!("{base_prefix}__{dir}");
+        derived_tiles
+            .entry(tile_id.clone())
+            .or_insert_with(|| crop_tile_scaled(&base_src, r, false, None).0);
+        textures.insert(dir.to_string(), json!(tile_id));
+        elements.push(json!({
+            "from": from, "to": to,
+            "faces": { dir: { "texture": format!("#{dir}"), "uv": [0, 0, 14, 14] } },
+        }));
+    }
+
+    // Neck collar; the up face is skipped: it is coplanar with (and hidden
+    // under) the shoulder plane above it.
+    let (neck, neck_tex) = entity_box_element(
+        &base_src,
+        derived_tiles,
+        &box_spec(base_prefix, "neck", [4.0, 13.0, 4.0], [12.0, 16.0, 12.0], 8, 3, 8, 0, 0)
+            .skipping(&["up"]),
+    );
+    elements.push(neck);
+    for (k, v) in neck_tex {
+        textures.insert(k, v);
+    }
+    textures.insert("particle".into(), json!("#north"));
+
+    let model_id = "minecraft:block/decorated_pot_synthetic";
+    raw_models.insert(model_id.into(), json!({ "textures": textures, "elements": elements }));
+    block_states.insert(state_key.into(), json!({ "variants": { "": { "model": model_id } } }));
+    1
+}
+
+// ---- End portals and lava --------------------------------------------------------
+
+/// A full-cube model whose six faces sample `texture` and cull against
+/// their own direction, used for the end-portal starfield (end_portal and
+/// end_gateway share one model — both render the whole cube in 26.3) and
+/// for lava (level variants fall back to "").
+fn full_cube_model(texture: &str) -> Value {
+    let mut faces = Map::new();
+    for dir in ["up", "down", "north", "south", "west", "east"] {
+        faces.insert(
+            dir.to_string(),
+            json!({ "texture": "#all", "uv": [0, 0, 16, 16], "cullface": dir }),
+        );
+    }
+    json!({
+        "textures": { "all": texture, "particle": "#all" },
+        "elements": [{ "from": [0.0, 0.0, 0.0], "to": [16.0, 16.0, 16.0], "faces": faces }],
+    })
+}
+
+fn synthesize_end_portals(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+) -> usize {
+    let model_id = "minecraft:block/end_portal_synthetic";
+    raw_models.insert(
+        model_id.into(),
+        full_cube_model("minecraft:entity/end_portal/end_portal"),
+    );
+    let mut count = 0;
+    for name in ["end_portal", "end_gateway"] {
+        let key = format!("minecraft:block/{name}");
+        if block_states.remove(&key).is_some() {
+            block_states.insert(key, json!({ "variants": { "": { "model": model_id } } }));
+            count += 1;
+        }
+    }
+    count
+}
+
+fn synthesize_lava(
+    block_states: &mut Map<String, Value>,
+    raw_models: &mut HashMap<String, Value>,
+) -> usize {
+    let key = "minecraft:block/lava";
+    if block_states.get(key).is_none() {
+        return 0;
+    }
+    let model_id = "minecraft:block/lava_synthetic";
+    raw_models.insert(model_id.into(), full_cube_model("minecraft:block/lava_still"));
+    // A single "" variant also covers level=0..15 (pickVariant falls back
+    // to it), and the full cube makes surface.ts occlusion/AO apply —
+    // lava is an opaque fluid in vanilla.
+    block_states.insert(key.into(), json!({ "variants": { "": { "model": model_id } } }));
+    1
+}
+
+// ---- Bare face-texture reference normalization -----------------------------------
+
+/// 26.x ships models whose element faces name a textures-map key without
+/// the '#' prefix (heavy_core writes "texture": "all"). The renderer only
+/// resolves '#'-prefixed refs, so such faces fall out of the atlas. Rewrite
+/// any bare face value that is a key of the same model's textures map;
+/// real texture ids contain '/' and never collide with the short keys.
+fn normalize_face_texture_refs(models: &mut HashMap<String, Value>) -> usize {
+    let mut fixed = 0;
+    for model in models.values_mut() {
+        let Some(keys): Option<Vec<String>> = model
+            .get("textures")
+            .and_then(|t| t.as_object())
+            .map(|o| o.keys().cloned().collect())
+        else {
+            continue;
+        };
+        if keys.is_empty() {
+            continue;
+        }
+        let Some(elements) = model.get_mut("elements").and_then(|e| e.as_array_mut()) else {
+            continue;
+        };
+        for element in elements {
+            let Some(faces) = element.get_mut("faces").and_then(|f| f.as_object_mut()) else {
+                continue;
+            };
+            for face in faces.values_mut() {
+                let Some(tex) = face
+                    .get("texture")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+                else {
+                    continue;
+                };
+                if !tex.starts_with('#') && keys.iter().any(|k| *k == tex) {
+                    if let Some(obj) = face.as_object_mut() {
+                        obj.insert("texture".into(), json!(format!("#{tex}")));
+                        fixed += 1;
+                    }
+                }
+            }
+        }
+    }
+    fixed
 }
 
 /// All model ids a blockstate JSON references: every variant value (object or
@@ -1132,5 +2071,396 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert!(model_texture_ids(&json!({"parent": "block/cube"})).is_empty());
+    }
+
+    // ---- entity-family synthesis tests ---------------------------------------
+
+    fn synth_texture(w: u32, h: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(w, h, |x, y| {
+            image::Rgba([(x % 251) as u8, (y % 241) as u8, 77, 255])
+        })
+    }
+
+    fn zip_from_textures(files: &[(&str, image::RgbaImage)]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, img) in files {
+            writer
+                .start_file::<_, ()>(*name, zip::write::FileOptions::default())
+                .unwrap();
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            std::io::Write::write_all(&mut writer, buf.get_ref()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn empty_states(names: &[&str]) -> Map<String, Value> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    format!("minecraft:block/{n}"),
+                    json!({ "variants": { "": { "model": "minecraft:block/placeholder" } } }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shulker_box_layout_matches_vanilla_textures() {
+        // Lid 16x12x16 @ (0,0), base 16x8x16 @ (0,28) on the 64x64 entity
+        // texture. The generic layout keeps the up face in the first slot:
+        // pixel-verified the lid's outer top is (16,0) with fill 1.00 while
+        // the second slot holds the mostly transparent interior view — the
+        // chest up/down swap must NOT apply here.
+        let lid = box_face_rects(16, 12, 16, 0, 0);
+        assert_eq!((lid[0].x, lid[0].y, lid[0].w, lid[0].h), (16, 0, 16, 16));
+        assert_eq!((lid[1].x, lid[1].y, lid[1].w, lid[1].h), (32, 0, 16, 16));
+        assert_eq!((lid[2].x, lid[2].y, lid[2].w, lid[2].h), (16, 16, 16, 12));
+        let base = box_face_rects(16, 8, 16, 0, 28);
+        assert_eq!((base[0].x, base[0].y, base[0].w, base[0].h), (16, 28, 16, 16));
+        assert_eq!((base[3].x, base[3].y, base[3].w, base[3].h), (48, 44, 16, 8));
+        // Both 17 shulker textures are 64x64 (plain + 16 dye colors).
+        assert_eq!(shulker_texture_stem("minecraft:block/shulker_box").as_deref(), Some("shulker"));
+        assert_eq!(
+            shulker_texture_stem("minecraft:block/purple_shulker_box").as_deref(),
+            Some("shulker_purple")
+        );
+        assert_eq!(shulker_texture_stem("minecraft:block/chest"), None);
+    }
+
+    #[test]
+    fn synthesizes_shulker_family_end_to_end() {
+        let bytes = zip_from_textures(&[
+            ("assets/minecraft/textures/entity/shulker/shulker.png", synth_texture(64, 64)),
+            ("assets/minecraft/textures/entity/shulker/shulker_purple.png", synth_texture(64, 64)),
+        ]);
+        let mut archive = open_zip(&bytes).unwrap();
+        let mut states = empty_states(&["shulker_box", "purple_shulker_box"]);
+        let mut models = HashMap::new();
+        let mut tiles = HashMap::new();
+        assert_eq!(synthesize_shulker_boxes(&mut states, &mut models, &mut archive, &mut tiles), 2);
+
+        let model = &models["minecraft:block/shulker_box_synthetic"];
+        let elements = model["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0]["from"], json!([0.0, 0.0, 0.0]));
+        assert_eq!(elements[0]["to"], json!([16.0, 8.0, 16.0]));
+        assert_eq!(elements[1]["from"], json!([0.0, 4.0, 0.0]));
+        assert_eq!(elements[1]["to"], json!([16.0, 16.0, 16.0]));
+        // Boundary faces cull; the interior overlap-band faces do not.
+        assert_eq!(elements[0]["faces"]["north"]["cullface"], json!("north"));
+        assert_eq!(elements[0]["faces"]["down"]["cullface"], json!("down"));
+        assert_eq!(elements[0]["faces"]["up"]["cullface"], Value::Null);
+        assert_eq!(elements[1]["faces"]["up"]["cullface"], json!("up"));
+
+        // Generic layout, no chest swap: base_up samples the first top slot
+        // (16,28) and lid_up the first slot (16,0); north tiles crop
+        // mirrored east-west (entity vs block u direction).
+        let src = synth_texture(64, 64);
+        let base_up = &tiles["minecraft:entity/shulker/shulker__base_up"];
+        assert_eq!(base_up.get_pixel(0, 0), src.get_pixel(16, 28));
+        let lid_up = &tiles["minecraft:entity/shulker/shulker__lid_up"];
+        assert_eq!(lid_up.get_pixel(0, 0), src.get_pixel(16, 0));
+        let base_north = &tiles["minecraft:entity/shulker/shulker__base_north"];
+        assert_eq!(base_north.get_pixel(0, 0), src.get_pixel(31, 44));
+
+        let variants = states["minecraft:block/shulker_box"]["variants"].as_object().unwrap();
+        assert_eq!(variants.len(), 7);
+        assert_eq!(
+            variants["facing=east"],
+            json!({ "model": "minecraft:block/shulker_box_synthetic", "x": 90, "y": 90 })
+        );
+        assert_eq!(
+            variants["facing=down"],
+            json!({ "model": "minecraft:block/shulker_box_synthetic", "x": 180 })
+        );
+        assert_eq!(variants["facing=north"]["x"], json!(90));
+        assert_eq!(variants[""].get("x"), None);
+        assert!(models.contains_key("minecraft:block/purple_shulker_box_synthetic"));
+    }
+
+    #[test]
+    fn crop_tile_scaled_fits_downscales_and_tints() {
+        let src = image::RgbaImage::from_pixel(64, 64, image::Rgba([241, 241, 241, 255]));
+        // Regions that fit keep their size.
+        let (tile, w, h) = crop_tile_scaled(&src, Rect { x: 0, y: 0, w: 8, h: 10 }, false, None);
+        assert_eq!((w, h), (8, 10));
+        assert_eq!(tile.get_pixel(7, 9).0, [241, 241, 241, 255]);
+        // Oversized regions scale to fit: the banner flag 20x40 -> 8x16.
+        let (tile, w, h) = crop_tile_scaled(&src, Rect { x: 1, y: 1, w: 20, h: 40 }, false, None);
+        assert_eq!((w, h), (8, 16));
+        assert_eq!(tile.get_pixel(8, 0).0[3], 0, "padded margin stays transparent");
+        // Tint premultiplies each channel (banner cloth dyeing).
+        let (tile, _, _) = crop_tile_scaled(&src, Rect { x: 0, y: 0, w: 2, h: 2 }, false, Some([128, 64, 255]));
+        assert_eq!(
+            tile.get_pixel(0, 0).0,
+            [
+                ((241 * 128 + 127) / 255) as u8,
+                ((241 * 64 + 127) / 255) as u8,
+                ((241 * 255 + 127) / 255) as u8,
+                255
+            ]
+        );
+        // Flip mirrors east-west.
+        let mut asym = image::RgbaImage::new(4, 1);
+        for x in 0..4 {
+            asym.put_pixel(x, 0, image::Rgba([x as u8, 0, 0, 255]));
+        }
+        let (tile, _, _) = crop_tile_scaled(&asym, Rect { x: 0, y: 0, w: 4, h: 1 }, true, None);
+        assert_eq!(tile.get_pixel(0, 0).0[0], 3);
+    }
+
+    #[test]
+    fn synthesizes_banners_with_dye_tint_and_rotations() {
+        let cloth = image::RgbaImage::from_pixel(64, 64, image::Rgba([241, 241, 241, 255]));
+        let bytes = zip_from_textures(&[(
+            "assets/minecraft/textures/entity/banner/banner_base.png",
+            cloth.clone(),
+        )]);
+        let mut archive = open_zip(&bytes).unwrap();
+        let mut states = empty_states(&["white_banner", "white_wall_banner"]);
+        let mut models = HashMap::new();
+        let mut tiles = HashMap::new();
+        assert_eq!(synthesize_banners(&mut states, &mut models, &mut archive, &mut tiles), 32);
+
+        let standing = &models["minecraft:block/white_banner_synthetic"];
+        let els = standing["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 3);
+        assert_eq!(els[0]["from"], json!([7.33, 0.0, 7.33]));
+        assert_eq!(els[0]["to"], json!([8.67, 28.0, 8.67]));
+        assert_eq!(els[1]["from"], json!([1.33, 28.0, 7.33]));
+        assert_eq!(els[2]["to"], json!([14.67, 29.33, 9.33]));
+        // Flag faces sample the scaled-down tile content.
+        assert_eq!(els[2]["faces"]["north"]["uv"], json!([0, 0, 8, 16]));
+
+        // Three residual bakes exist and rotate about the vertical axis
+        // through (8, 0, 8).
+        let r1 = &models["minecraft:block/white_banner_synthetic_r1"];
+        assert_eq!(
+            r1["elements"][0]["rotation"],
+            json!({ "origin": [8.0, 0.0, 8.0], "axis": "y", "angle": -22.5 })
+        );
+        let variants = states["minecraft:block/white_banner"]["variants"].as_object().unwrap();
+        assert_eq!(variants.len(), 16);
+        assert_eq!(variants["rotation=0"]["model"], json!("minecraft:block/white_banner_synthetic"));
+        assert_eq!(variants["rotation=4"], json!({ "model": "minecraft:block/white_banner_synthetic", "y": 90 }));
+        assert_eq!(variants["rotation=5"], json!({ "model": "minecraft:block/white_banner_synthetic_r1", "y": 90 }));
+        assert_eq!(variants["rotation=15"]["model"], json!("minecraft:block/white_banner_synthetic_r3"));
+
+        // Wall form: facings via y quarter turns, cloth hangs below the
+        // block (vanilla 26.3 wall-banner proportions).
+        let wall = &models["minecraft:block/white_wall_banner_synthetic"];
+        assert_eq!(wall["elements"][1]["from"], json!([1.33, -13.0, 13.67]));
+        assert_eq!(states["minecraft:block/white_wall_banner"]["variants"]["facing=east"]["y"], json!(90));
+
+        // Dye tint: white cloth premultiplied by the dye color (magenta
+        // 199,78,189); the wooden pole/bar tiles stay untinted and shared
+        // across all sixteen colors.
+        let flag = &tiles["minecraft:entity/banner/magenta__flag_north"];
+        assert_eq!(flag.dimensions(), (16, 16));
+        assert_eq!(
+            flag.get_pixel(0, 0).0,
+            [
+                ((241 * 199 + 127) / 255) as u8,
+                ((241 * 78 + 127) / 255) as u8,
+                ((241 * 189 + 127) / 255) as u8,
+                255
+            ]
+        );
+        let pole = &tiles["minecraft:entity/banner/wood__pole_north"];
+        assert_eq!(pole.get_pixel(0, 0).0, [241, 241, 241, 255]);
+        assert!(tiles.contains_key("minecraft:entity/banner/black__flag_north"));
+    }
+
+    #[test]
+    fn synthesizes_heads_floor_and_wall() {
+        let bytes = zip_from_textures(&[
+            ("assets/minecraft/textures/entity/creeper/creeper.png", synth_texture(64, 32)),
+            ("assets/minecraft/textures/entity/piglin/piglin.png", synth_texture(64, 64)),
+        ]);
+        let mut archive = open_zip(&bytes).unwrap();
+        let mut states = empty_states(&[
+            "creeper_head",
+            "creeper_wall_head",
+            "piglin_head",
+            "piglin_wall_head",
+        ]);
+        let mut models = HashMap::new();
+        let mut tiles = HashMap::new();
+        // Only creeper and piglin textures exist in the fixture zip; the
+        // other five kinds keep their placeholder blockstates.
+        assert_eq!(synthesize_heads(&mut states, &mut models, &mut archive, &mut tiles), 4);
+
+        let floor = &models["minecraft:block/creeper_head_synthetic"];
+        assert_eq!(floor["elements"][0]["from"], json!([4.0, 0.0, 4.0]));
+        assert_eq!(floor["elements"][0]["to"], json!([12.0, 8.0, 12.0]));
+        let wall = &models["minecraft:block/creeper_wall_head_synthetic"];
+        assert_eq!(wall["elements"][0]["from"], json!([4.0, 4.0, 8.0]));
+        assert_eq!(wall["elements"][0]["to"], json!([12.0, 12.0, 16.0]));
+
+        let floor_variants = states["minecraft:block/creeper_head"]["variants"].as_object().unwrap();
+        assert_eq!(floor_variants.len(), 16);
+        assert_eq!(
+            floor_variants["rotation=7"],
+            json!({ "model": "minecraft:block/creeper_head_synthetic_r3", "y": 90 })
+        );
+        let wall_variants = states["minecraft:block/creeper_wall_head"]["variants"].as_object().unwrap();
+        assert_eq!(wall_variants.len(), 5);
+        assert_eq!(wall_variants["facing=south"]["y"], json!(180));
+
+        // Piglin: skull + snout + tusks + tilted ears (z-rotation).
+        let piglin = &models["minecraft:block/piglin_head_synthetic"];
+        let els = piglin["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 6);
+        assert_eq!(els[0]["from"], json!([3.0, 0.0, 4.0]));
+        assert_eq!(
+            els[4]["rotation"],
+            json!({ "origin": [2.5, 3.0, 6.0], "axis": "z", "angle": 30.0 })
+        );
+        // The 45-degree residual bake: plain elements gain the y rotation,
+        // the already-rotated ear keeps its tilt while its box and pivot
+        // move along the arc.
+        let baked = &models["minecraft:block/piglin_head_synthetic_r2"];
+        assert_eq!(
+            baked["elements"][0]["rotation"],
+            json!({ "origin": [8.0, 0.0, 8.0], "axis": "y", "angle": -45.0 })
+        );
+        assert_eq!(baked["elements"][4]["rotation"]["angle"], json!(30.0));
+        let moved = rotate_y_about([2.5, 5.5, 6.0], [8.0, 0.0, 8.0], -45.0);
+        assert_eq!(baked["elements"][4]["from"][0].as_f64().unwrap(), moved[0] - 0.5);
+        assert_eq!(baked["elements"][4]["to"][1].as_f64().unwrap(), moved[1] + 2.5);
+    }
+
+    #[test]
+    fn synthesizes_golem_statues_with_waxed_sharing() {
+        let bytes = zip_from_textures(&[(
+            "assets/minecraft/textures/entity/copper_golem/copper_golem.png",
+            synth_texture(64, 64),
+        )]);
+        let mut archive = open_zip(&bytes).unwrap();
+        let mut states = empty_states(&[
+            "copper_golem_statue",
+            "exposed_copper_golem_statue",
+            "waxed_copper_golem_statue",
+            "waxed_exposed_copper_golem_statue",
+        ]);
+        let mut models = HashMap::new();
+        let mut tiles = HashMap::new();
+        // Only the plain texture exists: plain + waxed-plain synthesize,
+        // the exposed stems keep their placeholders.
+        assert_eq!(
+            synthesize_golem_statues(&mut states, &mut models, &mut archive, &mut tiles),
+            2
+        );
+        let model = &models["minecraft:block/copper_golem_statue_synthetic"];
+        let els = model["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 9);
+        assert_eq!(els[5]["from"], json!([4.0, 11.0, 3.0]), "skull");
+        assert_eq!(els[6]["from"], json!([7.0, 12.0, 2.0]), "nose at low z (faces north)");
+        assert_eq!(els[8]["to"], json!([10.0, 24.0, 10.0]), "antenna ball tops out at y24");
+        assert_eq!(
+            states["minecraft:block/waxed_copper_golem_statue"]["variants"]["facing=east"],
+            json!({ "model": "minecraft:block/copper_golem_statue_synthetic", "y": 90 })
+        );
+        // Untouched family keeps its placeholder blockstate verbatim.
+        assert_eq!(
+            states["minecraft:block/exposed_copper_golem_statue"]["variants"][""]["model"],
+            json!("minecraft:block/placeholder")
+        );
+    }
+
+    #[test]
+    fn synthesizes_conduit_pot_end_portals_and_lava() {
+        let bytes = zip_from_textures(&[
+            ("assets/minecraft/textures/entity/conduit/base.png", synth_texture(32, 16)),
+            ("assets/minecraft/textures/entity/conduit/cage.png", synth_texture(32, 16)),
+            ("assets/minecraft/textures/entity/decorated_pot/decorated_pot_base.png", synth_texture(32, 32)),
+            ("assets/minecraft/textures/entity/decorated_pot/decorated_pot_side.png", synth_texture(16, 16)),
+        ]);
+        let mut archive = open_zip(&bytes).unwrap();
+        let mut states = empty_states(&["conduit", "decorated_pot", "end_portal", "end_gateway", "lava"]);
+        let mut models = HashMap::new();
+        let mut tiles = HashMap::new();
+
+        assert_eq!(synthesize_conduits(&mut states, &mut models, &mut archive, &mut tiles), 1);
+        let conduit = &models["minecraft:block/conduit_synthetic"];
+        let els = conduit["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 2);
+        assert_eq!(els[0]["from"], json!([5.0, 5.0, 5.0]), "shell");
+        assert_eq!(els[1]["to"], json!([12.0, 12.0, 12.0]), "cage");
+        assert_eq!(conduit["textures"]["particle"], json!("#shell_north"));
+
+        assert_eq!(synthesize_decorated_pots(&mut states, &mut models, &mut archive, &mut tiles), 1);
+        let pot = &models["minecraft:block/decorated_pot_synthetic"];
+        let els = pot["elements"].as_array().unwrap();
+        assert_eq!(els.len(), 7, "4 walls + shoulder + base + neck");
+        assert_eq!(els[0]["faces"]["north"]["uv"], json!([0, 0, 14, 16]));
+        assert_eq!(els[0]["faces"].as_object().unwrap().len(), 1, "walls are one-faced planes");
+        assert_eq!(els[4]["faces"]["up"]["uv"], json!([0, 0, 14, 14]));
+        let neck = &els[6];
+        assert!(neck["faces"].get("up").is_none(), "neck top hidden under the shoulder plane");
+        assert_eq!(neck["faces"].as_object().unwrap().len(), 5);
+
+        assert_eq!(synthesize_end_portals(&mut states, &mut models), 2);
+        let end_model = &models["minecraft:block/end_portal_synthetic"];
+        assert_eq!(end_model["textures"]["all"], json!("minecraft:entity/end_portal/end_portal"));
+        for dir in ["up", "down", "north", "south", "west", "east"] {
+            assert_eq!(end_model["elements"][0]["faces"][dir]["cullface"], json!(dir));
+        }
+        assert_eq!(
+            states["minecraft:block/end_gateway"]["variants"][""]["model"],
+            json!("minecraft:block/end_portal_synthetic")
+        );
+
+        assert_eq!(synthesize_lava(&mut states, &mut models), 1);
+        let lava = &models["minecraft:block/lava_synthetic"];
+        assert_eq!(lava["textures"]["all"], json!("minecraft:block/lava_still"));
+        assert_eq!(lava["elements"][0]["from"], json!([0.0, 0.0, 0.0]));
+        assert_eq!(lava["elements"][0]["to"], json!([16.0, 16.0, 16.0]));
+        assert_eq!(
+            states["minecraft:block/lava"]["variants"][""]["model"],
+            json!("minecraft:block/lava_synthetic")
+        );
+    }
+
+    #[test]
+    fn bare_face_texture_refs_normalized_like_heavy_core() {
+        // Shaped after the shipped heavy_core model: faces name a textures
+        // key without '#', which the renderer cannot resolve against the
+        // atlas. Literal texture ids (paths) never match the short keys and
+        // stay verbatim.
+        let mut models: HashMap<String, Value> = [
+            (
+                "minecraft:block/heavy_core",
+                json!({
+                    "textures": { "all": "block/heavy_core", "particle": "block/heavy_core" },
+                    "elements": [{ "from": [4, 0, 4], "to": [12, 8, 12], "faces": {
+                        "north": { "uv": [0, 8, 8, 16], "texture": "all" },
+                        "up": { "uv": [0, 0, 8, 8], "texture": "#all" }
+                    }}]
+                }),
+            ),
+            (
+                "minecraft:block/cube",
+                json!({
+                    "textures": { "all": "block/stone" },
+                    "elements": [{ "from": [0, 0, 0], "to": [16, 16, 16], "faces": {
+                        "north": { "texture": "block/stone" }
+                    }}]
+                }),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        assert_eq!(normalize_face_texture_refs(&mut models), 1);
+        let heavy = &models["minecraft:block/heavy_core"];
+        assert_eq!(heavy["elements"][0]["faces"]["north"]["texture"], json!("#all"));
+        assert_eq!(heavy["elements"][0]["faces"]["up"]["texture"], json!("#all"));
+        assert_eq!(heavy["textures"]["all"], json!("block/heavy_core"), "texture map untouched");
+        let cube = &models["minecraft:block/cube"];
+        assert_eq!(cube["elements"][0]["faces"]["north"]["texture"], json!("block/stone"));
     }
 }
