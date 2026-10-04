@@ -77,7 +77,10 @@ withDefaults(defineProps<{ text?: string }>(), { text: '加载中…' })
   }
   51.35%,
   100% {
-    transform: translateX(320%) skewX(-16deg);
+    /* 420% of the 28%-wide band clears the mark's right edge with margin
+       for the skewX smear; 320% parked a lit tail on the last glyphs
+       throughout the rest phase. */
+    transform: translateX(420%) skewX(-16deg);
   }
 }
 
