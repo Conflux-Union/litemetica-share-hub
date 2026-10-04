@@ -134,7 +134,8 @@ export class MeshBudgetError extends Error {
 }
 
 /** Budget overrides for {@link extractSurface}; tests stub a small
- * `maxQuads` to exercise the guardrail without a 16M-quad fixture. */
+ * `maxQuads` to exercise the guardrail without a multi-million-quad
+ * fixture. */
 export interface MeshLimits {
   maxQuads?: number
 }
@@ -143,9 +144,17 @@ export interface MeshLimits {
  * strength table [1, 0.7, 0.5, 0.2]. */
 const AO_STRENGTH = [1, 0.7, 0.5, 0.2] as const
 
-/** Hard cap on emitted quads: beyond this the vertex buffers alone would
- * exhaust a browser tab (decode.ts guards the voxel count upstream). */
-const MAX_QUADS = 16_000_000
+/** Hard cap on emitted quads: past it the mesher throws MeshBudgetError and
+ * the pipeline degrades to the coarse LOD mesh (render/meshWorker) instead
+ * of dying. Each quad costs ~232B of typed channels (52 floats + 6
+ * indices); capacity-doubling briefly holds two copies, and the final
+ * concat adds another full set before the channels free. The cap must sit
+ * where a tab still reaches it — the old 16M (~3.7GB of channels alone)
+ * fired long after the OOM it was meant to prevent. Anchor: the real
+ * bridge fixture (566x256x1423, rough terrain) meshes to 2.34M quads and
+ * must stay full-precision, so the budget sits just above it; anything
+ * rougher degrades. decode.ts guards the voxel count upstream. */
+const MAX_QUADS = 3_000_000
 
 /** Above this many AO-occluding voxels the mesher stops baking per-vertex
  * AO (and, in the flat-color fallback, merges runs by geometry with corner
@@ -336,24 +345,45 @@ function warnTexture(textureId: string): void {
   console.warn(`[render] texture "${textureId}" is not in the atlas; rendering magenta`)
 }
 
-/** True when a full-cube model compiles to exactly the six cube faces —
- * one culled quad per direction whose uvs still cover the whole 0..16
- * tile. Those faces are exactly what CUBE_FACES can rebuild merged;
- * explicit uv sub-rects or missing cullfaces stay on the template path. */
+/** True when a full-cube model compiles to exactly the six canonical cube
+ * faces — one culled quad per direction whose corner positions and
+ * per-corner uv binding match CUBE_FACES (corners matched by position, so
+ * the compiled vertex order may be any rotation of the table's). The merged
+ * path rebuilds geometry and uvs from that table, so anything else must keep
+ * the template path, which preserves the model's uvs verbatim: explicit uv
+ * sub-rects, per-face texture rotation 90/180/270 (glazed terracotta,
+ * crafter, pistons — the corner set still covers 0/16 but each corner reads
+ * a rotated texel), and variant turns that spin the uv axes (horizontal
+ * logs via cube_column x=90). */
 function mergeableCube(quads: Quad[]): boolean {
   if (quads.length !== 6) return false
   const seen = new Set<FaceDir>()
   for (const q of quads) {
     if (q.cullface === undefined || seen.has(q.cullface)) return false
     seen.add(q.cullface)
-    let combos = 0
-    for (const uv of q.uvs) {
-      const uEdge = uv[0] <= 1e-6 ? 0 : uv[0] >= 16 - 1e-6 ? 1 : -1
-      const vEdge = uv[1] <= 1e-6 ? 0 : uv[1] >= 16 - 1e-6 ? 1 : -1
-      if (uEdge < 0 || vEdge < 0) return false
-      combos |= 1 << (uEdge | (vEdge << 1))
+    const face = CUBE_FACES[DIR_INDEX[q.cullface]]
+    let bound = 0
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        const c = face.corners[j]
+        if (
+          Math.abs(q.positions[i][0] - c[0]) > 1e-6 ||
+          Math.abs(q.positions[i][1] - c[1]) > 1e-6 ||
+          Math.abs(q.positions[i][2] - c[2]) > 1e-6
+        ) {
+          continue
+        }
+        if (
+          Math.abs(q.uvs[i][0] - face.uvs[j][0]) > 1e-6 ||
+          Math.abs(q.uvs[i][1] - face.uvs[j][1]) > 1e-6
+        ) {
+          return false
+        }
+        bound |= 1 << j
+        break
+      }
     }
-    if (combos !== 0b1111) return false
+    if (bound !== 0b1111) return false
   }
   return true
 }

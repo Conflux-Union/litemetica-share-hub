@@ -155,8 +155,24 @@ async function render() {
   progress.value = null
   notice.value = ''
 
-  const width = container.value.clientWidth
-  const height = container.value.clientHeight
+  try {
+    await renderCurrent(stale)
+  } catch (e) {
+    // Superseded renders die quietly: a newer cycle owns the UI state.
+    // Anything else clears the loader so the error overlay is reachable —
+    // guardrail messages included.
+    if (!stale()) {
+      error.value = e instanceof Error ? e.message : '预览渲染失败'
+      loading.value = false
+    }
+  }
+}
+
+async function renderCurrent(stale: () => boolean): Promise<void> {
+  const host = container.value
+  if (!host) return
+  const width = host.clientWidth
+  const height = host.clientHeight
 
   // 1. Fetch the gzipped RLE preview data.
   const resp = await fetch(api.previewUrl(props.schematicId))
@@ -198,7 +214,7 @@ async function render() {
   const renderer = new THREE.WebGLRenderer({ antialias: true })
   renderer.setSize(width, height)
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-  container.value.appendChild(renderer.domElement)
+  host.appendChild(renderer.domElement)
 
   const materials: THREE.Material[] = []
   /** Full-precision level meshes — hidden as one group when the coarse
@@ -311,7 +327,7 @@ async function render() {
     camera.updateProjectionMatrix()
     renderer.setSize(w, h)
   })
-  ro.observe(container.value)
+  ro.observe(host)
 
   const themeObserver = new MutationObserver(applyBackground)
   themeObserver.observe(document.documentElement, {
@@ -346,30 +362,17 @@ function stopRender(): void {
   dispose = null
 }
 
-/** Shared catch: superseded renders are silent, everything else (guardrail
- * Chinese errors included) reaches the overlay verbatim. */
-function reportError(e: unknown): void {
-  if (e instanceof RenderSuperseded) return
-  error.value = e instanceof Error ? e.message : '预览渲染失败'
-}
-
-onMounted(async () => {
-  try {
-    await render()
-  } catch (e) {
-    reportError(e)
-  }
+/** render() owns its failure handling (see its catch): superseded cycles
+ * are silent, everything else clears the loader and reaches the overlay. */
+onMounted(() => {
+  void render()
 })
 
 watch(
   () => props.schematicId,
-  async () => {
+  () => {
     stopRender()
-    try {
-      await render()
-    } catch (e) {
-      reportError(e)
-    }
+    void render()
   },
 )
 

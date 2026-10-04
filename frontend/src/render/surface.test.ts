@@ -89,10 +89,51 @@ const MODELS: Record<string, ModelJson> = {
   },
   // Vanilla water model: particle-only, no elements (needs synthesis).
   'minecraft:block/water': { textures: { particle: 'minecraft:block/water_still' } },
+  // Full cube with one rotated face (glazed-terracotta pattern): the uv
+  // corner set still covers 0/16, but each corner reads a rotated texel.
+  'minecraft:block/rotated_face': {
+    textures: { all: 'minecraft:block/glaze' },
+    elements: [
+      {
+        from: [0, 0, 0],
+        to: [16, 16, 16],
+        faces: {
+          down: { texture: '#all', cullface: 'down' },
+          up: { texture: '#all', cullface: 'up' },
+          north: { texture: '#all', cullface: 'north', rotation: 90 },
+          south: { texture: '#all', cullface: 'south' },
+          west: { texture: '#all', cullface: 'west' },
+          east: { texture: '#all', cullface: 'east' },
+        },
+      },
+    ],
+  },
+  // cube_column shape: canonical upright, but the axis=x variant turn spins
+  // the uv axes of the faces it rotates (horizontal logs).
+  'minecraft:block/column': {
+    textures: { end: 'minecraft:block/log_end', side: 'minecraft:block/log_side' },
+    elements: [
+      {
+        from: [0, 0, 0],
+        to: [16, 16, 16],
+        faces: {
+          down: { texture: '#end', cullface: 'down' },
+          up: { texture: '#end', cullface: 'up' },
+          north: { texture: '#side', cullface: 'north' },
+          south: { texture: '#side', cullface: 'south' },
+          west: { texture: '#side', cullface: 'west' },
+          east: { texture: '#side', cullface: 'east' },
+        },
+      },
+    ],
+  },
 }
 
 const BLOCKSTATES: Record<string, BlockstateJson> = {
   'minecraft:stone': { variants: { '': { model: 'minecraft:block/stone' } } },
+  // Distinct id resolving to the same model+texture as stone (material-key
+  // merging coverage).
+  'minecraft:stone2': { variants: { '': { model: 'minecraft:block/stone' } } },
   'minecraft:glass': { variants: { '': { model: 'minecraft:block/glass' } } },
   'minecraft:oak_leaves': { variants: { '': { model: 'minecraft:block/oak_leaves' } } },
   'minecraft:orphan': { variants: { '': { model: 'minecraft:block/orphan_tex' } } },
@@ -105,6 +146,13 @@ const BLOCKSTATES: Record<string, BlockstateJson> = {
   },
   'minecraft:short_grass': { variants: { '': { model: 'minecraft:block/cross_plant' } } },
   'minecraft:water': { variants: { '': { model: 'minecraft:block/water' } } },
+  'minecraft:glaze': { variants: { '': { model: 'minecraft:block/rotated_face' } } },
+  'minecraft:oak_log': {
+    variants: {
+      'axis=y': { model: 'minecraft:block/column' },
+      'axis=x': { model: 'minecraft:block/column', x: 90 },
+    },
+  },
 }
 
 const ASSETS: VanillaAssets = { blockStates: BLOCKSTATES, blockModels: MODELS }
@@ -118,6 +166,9 @@ const ALPHAS: Record<string, 'opaque' | 'cutout' | 'translucent'> = {
   'minecraft:block/dirt': 'opaque',
   'minecraft:block/plant': 'cutout',
   'minecraft:block/water_still': 'translucent',
+  'minecraft:block/glaze': 'opaque',
+  'minecraft:block/log_end': 'opaque',
+  'minecraft:block/log_side': 'opaque',
 }
 
 /** Maps model uv 0..16 onto the atlas quadrant [0.25,0.75]×[0.75,0.25]. */
@@ -350,12 +401,13 @@ describe('ambient occlusion', () => {
     // AO trigger count: exactly 3 of the 4 corners were dimmed.
     expect(up.filter((v) => mesh.colors[v * 3] < 1).length).toBe(3)
 
-    // Ring order here is [c3,c2,c1,c0] (compileGeometry reverses ±Y
-    // winding): default diagonal c3-c1 sums 1.4 > c2-c0's 1.2, so the
-    // default triangulation stays.
+    // The greedy scan emits single AO-shadowed cells in CUBE_FACES corner
+    // order — here [(0,1,0),(0,1,1),(1,1,1),(1,1,0)] with strengths
+    // [1, 0.7, 0.2, 0.7]: the default diagonal 0-2 sums 1.2 < the flipped
+    // pair's 1.4, so the triangulation flips onto the brighter pair.
     const b = Math.min(...up)
-    expectIndexSequence(mesh, [b, b + 1, b + 2, b, b + 2, b + 3])
-    expectNoIndexSequence(mesh, [b + 1, b + 2, b + 3, b + 1, b + 3, b])
+    expectIndexSequence(mesh, [b + 1, b + 2, b + 3, b + 1, b + 3, b])
+    expectNoIndexSequence(mesh, [b, b + 1, b + 2, b, b + 2, b + 3])
   })
 
   it('flips the quad diagonal when the default one joins the darker pair', () => {
@@ -375,11 +427,12 @@ describe('ambient occlusion', () => {
     expect(colorAt(mesh, up[1])[0]).toBeCloseTo(0.7, 6)
     expect(colorAt(mesh, up[2])[0]).toBeCloseTo(1, 6)
     expect(colorAt(mesh, up[3])[0]).toBeCloseTo(0.7, 6)
-    // Push order [c3,c2,c1,c0] = [0.7, 1, 0.7, 0.7]: default diagonal sums
-    // 1.4 < 1.7, so the triangulation flips onto the brighter pair.
+    // Corner order [(1,1,1),(1,1,2),(2,1,2),(2,1,1)] with strengths
+    // [0.7, 0.7, 1, 0.7]: default diagonal 0-2 sums 1.7 > the other pair's
+    // 1.4, so the default triangulation already joins the brighter pair.
     const b = Math.min(...up)
-    expectIndexSequence(mesh, [b + 1, b + 2, b + 3, b + 1, b + 3, b])
-    expectNoIndexSequence(mesh, [b, b + 1, b + 2, b, b + 2, b + 3])
+    expectIndexSequence(mesh, [b, b + 1, b + 2, b, b + 2, b + 3])
+    expectNoIndexSequence(mesh, [b + 1, b + 2, b + 3, b + 1, b + 3, b])
   })
 
   it('non-full-cube neighbors do not trigger AO', () => {
@@ -605,4 +658,142 @@ describe('greedy merging', () => {
     expect(mesh.faceCount).toBe(10)
     expect(mesh.ranges.opaque.count).toBe(60)
   })
+
+  it('merges different states that render identically (shared texture)', () => {
+    // stone and stone2 resolve to the same model/texture/tint/alpha: their
+    // faces are one material, so the run merges as if it were one state.
+    const mesh = meshOf(['minecraft:stone', 'minecraft:stone2'], [['ab']])
+    expect(mesh.faceCount).toBe(6)
+    expect(mesh.ranges.opaque.count).toBe(36)
+  })
+
+  it('merges different states that share one fallback color (no bundle)', () => {
+    // Stair facings differ only in properties; blockColor strips them, so
+    // both cells render the same flat color and merge.
+    const mesh = meshOf(
+      ['minecraft:oak_stairs[facing=east]', 'minecraft:oak_stairs[facing=west]'],
+      [['ab']],
+      null,
+    )
+    expect(mesh.faceCount).toBe(6)
+    expect(mesh.ranges.flat.count).toBe(36)
+  })
+
+  it('keeps per-face texture rotation off the merged path', () => {
+    // The rotated north face's uv corners still cover 0/16 (the old
+    // mergeability check passed), but a merged quad would rebuild the
+    // canonical binding and spin the texture. The run must stay unmerged
+    // and the model's uvs must survive verbatim.
+    const mesh = meshOf(['minecraft:glaze'], [['aa']])
+    expect(mesh.faceCount).toBe(10) // two cubes, shared pair culled, no merge
+    const corner = vertexAt(mesh, [0, 0, 0], [0, 0, -1])
+    expect(corner).toHaveLength(1)
+    // rotation 90: the (0,0,0) corner reads texel (16,0), not the canonical
+    // (16,16) a merged quad would emit.
+    expect(uvAt(mesh, corner[0])).toEqual([16, 0])
+  })
+
+  it('keeps variant-turned cubes (horizontal logs) off the merged path', () => {
+    // Upright logs are canonical cubes and merge; the x=90 turn spins the
+    // uv axes of the rotated faces, so the lying run stays per-voxel.
+    const upright = meshOf(['minecraft:oak_log[axis=y]'], [['aa']])
+    expect(upright.faceCount).toBe(6)
+    const lying = meshOf(['minecraft:oak_log[axis=x]'], [['aa']])
+    expect(lying.faceCount).toBe(10)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Coarse merge (giant grids)
+// ---------------------------------------------------------------------------
+
+describe('coarse merge', () => {
+  /** Solid block with a one-deep square trench carved into the top layer;
+   * the trench walls/floor are the AO-shadowed surfaces. */
+  function trenchedCube(n: number): VoxelGrid {
+    const data = new Uint16Array(n * n * n)
+    data.fill(1)
+    const lo = Math.floor(n / 4)
+    const hi = n - lo
+    for (let z = lo; z < hi; z++) {
+      for (let x = lo; x < hi; x++) data[((n - 1) * n + z) * n + x] = 0
+    }
+    return { dims: [n, n, n], palette: ['minecraft:air', 'minecraft:stone'], data }
+  }
+
+  it(
+    'drops per-vertex AO and merges by geometry past the occluder cap',
+    () => {
+      // 160^3 = 4.096M occluders > COARSE_MERGE_MAX_OCCLUDERS (3M).
+      const huge = extractSurface(trenchedCube(160), null, new Map())
+      // Geometry-only merging: 4 top rects around the trench, trench floor,
+      // 4 trench walls, 4 outer sides, bottom.
+      expect(huge.faceCount).toBeLessThan(20)
+      // No AO anywhere: every vertex color is the stone color × one of the
+      // four directional face lights (never darker).
+      const stone = 0x7d / 255
+      const lights = [1.0, 0.86, 0.72, 0.5]
+      for (let i = 0; i < huge.colors.length; i++) {
+        const c = huge.colors[i] / stone
+        expect(lights.some((l) => Math.abs(c - l) < 1e-6)).toBe(true)
+      }
+
+      // Control: the same shape at 40^3 (64k occluders) keeps exact AO, so
+      // trench edges stop merging and darkened corners exist.
+      const small = extractSurface(trenchedCube(40), null, new Map())
+      expect(small.faceCount).toBeGreaterThan(huge.faceCount)
+      let darkened = 0
+      for (let i = 0; i < small.colors.length; i++) {
+        if (small.colors[i] < stone * 0.5 - 1e-6) darkened++
+      }
+      expect(darkened).toBeGreaterThan(0)
+    },
+    120_000,
+  )
+
+  it(
+    'colors geometry-merged runs from the corner cells in the fallback',
+    () => {
+      // Two half-slabs of different colors side by side, made giant by
+      // depth so the coarse path engages: one merged top quad whose corner
+      // colors are each half's block color (locally averaged, not one flat
+      // color and not the palette anchor alone).
+      const n = 200
+      const data = new Uint16Array(n * n * n)
+      for (let y = 0; y < n; y++) {
+        for (let z = 0; z < n; z++) {
+          for (let x = 0; x < n; x++) data[(y * n + z) * n + x] = x < n / 2 ? 1 : 2
+        }
+      }
+      const grid: VoxelGrid = {
+        dims: [n, n, n],
+        palette: ['minecraft:air', 'minecraft:stone', 'minecraft:sand'],
+        data,
+      }
+      const mesh = extractSurface(grid, null, new Map())
+      // Top faces merge into one quad spanning both colors: its four
+      // corners split between stone and sand.
+      const stone = 0x7d / 255
+      const sand = 0xdb / 255
+      let stoneCorners = 0
+      let sandCorners = 0
+      for (let i = 0; i < mesh.positions.length / 3; i++) {
+        if (mesh.normals[i * 3 + 1] !== 1) continue
+        // Only the single merged top quad spans y = n.
+        if (Math.abs(mesh.positions[i * 3 + 1] - n) > 1e-9) continue
+        if (mesh.positions[i * 3] < n / 2) stoneCorners++
+        else sandCorners++
+      }
+      expect(stoneCorners).toBe(2)
+      expect(sandCorners).toBe(2)
+      // And the corner colors really are the two block colors × up light.
+      for (let i = 0; i < mesh.positions.length / 3; i++) {
+        if (mesh.normals[i * 3 + 1] !== 1) continue
+        if (Math.abs(mesh.positions[i * 3 + 1] - n) > 1e-9) continue
+        const expected = mesh.positions[i * 3] < n / 2 ? stone : sand
+        expect(mesh.colors[i * 3]).toBeCloseTo(expected, 6)
+      }
+    },
+    120_000,
+  )
 })
