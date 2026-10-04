@@ -3,9 +3,10 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { api, ApiError } from '../api'
-import { loadAssets } from '../render/assets'
+import { atlasTileSpan, loadAssets } from '../render/assets'
 import { decodePreview } from '../render/decode'
 import { extractSurface, type MeshData } from '../render/surface'
+import { applyTiledAtlas } from '../render/tiledMaterial'
 import BrandLoader from './BrandLoader.vue'
 
 const props = defineProps<{ schematicId: string }>()
@@ -23,6 +24,9 @@ function rangeGeometry(mesh: MeshData, range: { start: number; count: number }):
   geometry.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3))
   geometry.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3))
   geometry.setAttribute('uv', new THREE.BufferAttribute(mesh.uvs, 2))
+  // Local texel-space uvs pair with the per-vertex tile origin; the
+  // patched materials wrap them into the atlas per fragment.
+  geometry.setAttribute('tileOrigin', new THREE.BufferAttribute(mesh.tileOrigins, 2))
   geometry.setAttribute('color', new THREE.BufferAttribute(mesh.colors, 3))
   geometry.setIndex(
     new THREE.BufferAttribute(mesh.indices.subarray(range.start, range.start + range.count), 1),
@@ -80,23 +84,19 @@ async function render() {
   if (store) {
     // Three render passes by alpha class, plus the untextured placeholder
     // pass. Cutout stays z-buffered via alphaTest; translucents blend last.
-    addMesh(
-      mesh.ranges.opaque,
-      new THREE.MeshLambertMaterial({ map: store.texture, vertexColors: true }),
-    )
-    addMesh(
-      mesh.ranges.cutout,
-      new THREE.MeshLambertMaterial({ map: store.texture, vertexColors: true, alphaTest: 0.5 }),
-    )
+    // Textured passes sample the gutterless atlas through the tiled-UV
+    // patch (local 0..16 texel uvs + per-vertex tile origin).
+    const span = atlasTileSpan(store.bundle)
+    const textured = (opts: THREE.MeshLambertMaterialParameters): THREE.MeshLambertMaterial => {
+      const material = new THREE.MeshLambertMaterial({ map: store.texture, vertexColors: true, ...opts })
+      applyTiledAtlas(material, span)
+      return material
+    }
+    addMesh(mesh.ranges.opaque, textured({}))
+    addMesh(mesh.ranges.cutout, textured({ alphaTest: 0.5 }))
     addMesh(
       mesh.ranges.translucent,
-      new THREE.MeshLambertMaterial({
-        map: store.texture,
-        vertexColors: true,
-        transparent: true,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      }),
+      textured({ transparent: true, depthWrite: false, side: THREE.DoubleSide }),
     )
     addMesh(mesh.ranges.flat, new THREE.MeshLambertMaterial({ vertexColors: true }))
   } else {

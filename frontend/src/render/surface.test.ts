@@ -45,12 +45,12 @@ const MODELS: Record<string, ModelJson> = {
         from: [0, 0, 0],
         to: [16, 16, 16],
         faces: {
-          down: { texture: '#bottom' },
-          up: { texture: '#top', tintindex: 0 },
-          north: { texture: '#side' },
-          south: { texture: '#side' },
-          west: { texture: '#side' },
-          east: { texture: '#side' },
+          down: { texture: '#bottom', cullface: 'down' },
+          up: { texture: '#top', tintindex: 0, cullface: 'up' },
+          north: { texture: '#side', cullface: 'north' },
+          south: { texture: '#side', cullface: 'south' },
+          west: { texture: '#side', cullface: 'west' },
+          east: { texture: '#side', cullface: 'east' },
         },
       },
     ],
@@ -187,6 +187,10 @@ function colorAt(mesh: MeshData, vertex: number): [number, number, number] {
   return [mesh.colors[vertex * 3], mesh.colors[vertex * 3 + 1], mesh.colors[vertex * 3 + 2]]
 }
 
+function uvAt(mesh: MeshData, vertex: number): [number, number] {
+  return [mesh.uvs[vertex * 2], mesh.uvs[vertex * 2 + 1]]
+}
+
 function hasIndexSequence(mesh: MeshData, seq: number[]): boolean {
   for (let i = 0; i + seq.length <= mesh.indices.length; i++) {
     if (seq.every((v, j) => mesh.indices[i + j] === v)) return true
@@ -207,10 +211,10 @@ function expectNoIndexSequence(mesh: MeshData, seq: number[]): void {
 // ---------------------------------------------------------------------------
 
 describe('mesher culling', () => {
-  it('stone next to stone culls the shared interior faces', () => {
+  it('stone next to stone culls the shared interior faces and merges the rest', () => {
     const mesh = meshOf(['minecraft:stone'], [['aaa']])
-    expect(mesh.faceCount).toBe(14) // 3×6 − 2 shared faces × 2 sides
-    expect(mesh.ranges.opaque.count).toBe(84)
+    expect(mesh.faceCount).toBe(6) // one merged quad per direction
+    expect(mesh.ranges.opaque.count).toBe(36)
     expect(mesh.ranges.cutout.count).toBe(0)
     expect(mesh.ranges.translucent.count).toBe(0)
     expect(mesh.ranges.flat.count).toBe(0)
@@ -222,14 +226,14 @@ describe('mesher culling', () => {
       ['aaa', 'aaa', 'aaa'],
       ['aaa', 'aaa', 'aaa'],
     ])
-    expect(mesh.faceCount).toBe(54) // only the 6 outer faces × 9 voxels each
-    expect(mesh.ranges.opaque.count).toBe(324)
+    expect(mesh.faceCount).toBe(6) // the 6 outer faces merge to one quad each
+    expect(mesh.ranges.opaque.count).toBe(36)
   })
 
   it('glass culls against glass (same cull group) but not against stone', () => {
     const glass = meshOf(['minecraft:glass'], [['aa']])
-    expect(glass.faceCount).toBe(10)
-    expect(glass.ranges.translucent.count).toBe(60)
+    expect(glass.faceCount).toBe(6) // shared east/west pair culled, rest merged
+    expect(glass.ranges.translucent.count).toBe(36)
 
     const pair = meshOf(['minecraft:glass', 'minecraft:stone'], [['ab']])
     // Glass face toward stone is culled (stone occludes)…
@@ -241,8 +245,8 @@ describe('mesher culling', () => {
 
   it('leaves cull against leaves via their cull group', () => {
     const mesh = meshOf(['minecraft:oak_leaves'], [['aa']])
-    expect(mesh.faceCount).toBe(10)
-    expect(mesh.ranges.cutout.count).toBe(60)
+    expect(mesh.faceCount).toBe(6)
+    expect(mesh.ranges.cutout.count).toBe(36)
   })
 
   it('a slab (non-full-cube) never occludes the neighbor face', () => {
@@ -289,10 +293,12 @@ describe('placeholder rendering', () => {
     expect(up).toHaveLength(1)
     expect(colorAt(mesh, up[0])).toEqual([1, 0, 1]) // magenta × face light 1.0
 
-    // Flat quads never sample the atlas: uv stays at the origin.
+    // Flat quads never sample the atlas: uv and tile origin stay at 0.
     for (let i = 0; i < mesh.uvs.length / 2; i++) {
       expect(mesh.uvs[i * 2]).toBe(0)
       expect(mesh.uvs[i * 2 + 1]).toBe(0)
+      expect(mesh.tileOrigins[i * 2]).toBe(0)
+      expect(mesh.tileOrigins[i * 2 + 1]).toBe(0)
     }
 
     expect(warnSpy).toHaveBeenCalledTimes(1)
@@ -419,23 +425,17 @@ describe('draw-range segments', () => {
     for (const idx of mesh.indices) expect(idx).toBeLessThan(verts)
   })
 
-  it('maps model uv 0..16 through the tile transform', () => {
+  it('emits local texel uvs paired with per-vertex tile origins', () => {
     const mesh = meshOf(['minecraft:stone'], [['a']])
-    let minU = Infinity
-    let maxU = -Infinity
-    let minV = Infinity
-    let maxV = -Infinity
+    // Every vertex carries the stone tile's atlas origin; the uv attribute
+    // stays in model texel space (corner values 0 or 16) for the
+    // tiled-uv materials to wrap per fragment.
     for (let i = 0; i < mesh.uvs.length / 2; i++) {
-      minU = Math.min(minU, mesh.uvs[i * 2])
-      maxU = Math.max(maxU, mesh.uvs[i * 2])
-      minV = Math.min(minV, mesh.uvs[i * 2 + 1])
-      maxV = Math.max(maxV, mesh.uvs[i * 2 + 1])
+      expect(mesh.uvs[i * 2] === 0 || mesh.uvs[i * 2] === 16).toBe(true)
+      expect(mesh.uvs[i * 2 + 1] === 0 || mesh.uvs[i * 2 + 1] === 16).toBe(true)
+      expect(mesh.tileOrigins[i * 2]).toBeCloseTo(TILE.u0, 9)
+      expect(mesh.tileOrigins[i * 2 + 1]).toBeCloseTo(TILE.v0, 9)
     }
-    expect(minU).toBeCloseTo(TILE.u0, 9)
-    expect(maxU).toBeCloseTo(TILE.u0 + 16 * TILE.du, 9)
-    // v is flipped: model v=16 maps below model v=0.
-    expect(maxV).toBeCloseTo(TILE.v0, 9)
-    expect(minV).toBeCloseTo(TILE.v0 + 16 * TILE.dv, 9)
   })
 })
 
@@ -469,9 +469,9 @@ describe('water synthesis', () => {
   it('renders water as tinted translucent cubes that cull against each other', () => {
     resetTintColors()
     const mesh = meshOf(['minecraft:water[level=0]'], [['aa']])
-    expect(mesh.ranges.translucent.count).toBe(60) // 10 of 12 faces survive
+    expect(mesh.ranges.translucent.count).toBe(36) // 10 of 12 faces survive, merged to 6
     expect(mesh.ranges.opaque.count).toBe(0)
-    expect(mesh.faceCount).toBe(10)
+    expect(mesh.faceCount).toBe(6)
     // Synthesized quads carry tintindex 0 → water blue baked into vertices.
     const up = vertexAt(mesh, [0, 1, 0], [0, 1, 0])[0]
     const water = colorAt(mesh, up)
@@ -509,12 +509,100 @@ describe('water synthesis', () => {
 describe('flat-color fallback (no bundle)', () => {
   it('meshes full cubes with block colors baked into vertex colors', () => {
     const mesh = meshOf(['minecraft:stone', 'minecraft:grass_block'], [['ab']], null)
-    expect(mesh.ranges.flat.count).toBe(60) // 10 of 12 faces (shared pair culled)
+    expect(mesh.ranges.flat.count).toBe(60) // 10 of 12 faces (shared pair culled, rest merged)
     expect(mesh.ranges.opaque.count).toBe(0)
     const stone = vertexAt(mesh, [0, 0, 0], [-1, 0, 0])[0]
     // Stone gray 0x7d7d7d × the ±x face light 0.72.
     expect(colorAt(mesh, stone)[0]).toBeCloseTo((0x7d / 255) * 0.72, 6)
     expect(colorAt(mesh, stone)[1]).toBeCloseTo((0x7d / 255) * 0.72, 6)
     expect(colorAt(mesh, stone)[2]).toBeCloseTo((0x7d / 255) * 0.72, 6)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Greedy merging
+// ---------------------------------------------------------------------------
+
+describe('greedy merging', () => {
+  it('merges a same-state run into one quad per direction', () => {
+    const mesh = meshOf(['minecraft:stone'], [['aaa', 'aaa', 'aaa']])
+    expect(mesh.faceCount).toBe(6)
+    // The up face is one 3x3 quad whose far corner sits at the run's edge
+    // with its uv scaled to 0..48 texels (16 per block).
+    const far = vertexAt(mesh, [3, 1, 3], [0, 1, 0])
+    expect(far).toHaveLength(1)
+    expect(uvAt(mesh, far[0])).toEqual([48, 48])
+    expect(mesh.tileOrigins[far[0] * 2]).toBeCloseTo(TILE.u0, 9)
+    expect(mesh.tileOrigins[far[0] * 2 + 1]).toBeCloseTo(TILE.v0, 9)
+    // Interior merge does not double-emit: the down face's near corner
+    // exists exactly once too.
+    expect(vertexAt(mesh, [0, 0, 0], [0, -1, 0])).toHaveLength(1)
+  })
+
+  it('keeps AO-shadowed faces unmerged with per-corner AO like the per-face path', () => {
+    // A 3-wide stone strip with one raised block on top: the strip's up
+    // faces flanking the raised block see it in their outside-cell rings
+    // and emit alone with vertex AO (the middle one is culled outright);
+    // the raised block's own top and the strip's down face stay clean and
+    // merge. Same AO strength values as the per-voxel path would bake.
+    const mesh = meshOf(['minecraft:stone'], [['aaa'], ['.a.']])
+    // up 3 (two AO-shadowed + merged raised top), down 1 (merged strip),
+    // north/south 2 each (merged strip + merged raised), west/east 2 each
+    // (merged strip end + AO-shadowed raised side).
+    expect(mesh.faceCount).toBe(12)
+    const cornerLight = (p: [number, number, number]): number[] =>
+      vertexAt(mesh, p, [0, 1, 0]).map((v) => colorAt(mesh, v)[0])
+    expect(cornerLight([0, 1, 0])).toEqual([1])
+    // Vertex colors live in a Float32Array: compare the AO strength, not
+    // the exact float32 rounding of 0.7.
+    expect(cornerLight([1, 1, 0])[0]).toBeCloseTo(0.7, 6)
+    expect(cornerLight([2, 1, 0])[0]).toBeCloseTo(0.7, 6)
+  })
+
+  it('merges glass runs while the cull group still hides shared faces', () => {
+    const mesh = meshOf(['minecraft:glass'], [['aaa']])
+    expect(mesh.faceCount).toBe(6) // interior east/west pair culled
+    expect(mesh.ranges.translucent.count).toBe(36)
+  })
+
+  it('merges water surfaces into single quads with the water tint', () => {
+    resetTintColors()
+    const mesh = meshOf(['minecraft:water[level=0]'], [['aaa', 'aaa']])
+    expect(mesh.faceCount).toBe(6)
+    expect(mesh.ranges.translucent.count).toBe(36)
+    const far = vertexAt(mesh, [3, 1, 2], [0, 1, 0])
+    expect(far).toHaveLength(1)
+    expect(uvAt(mesh, far[0])).toEqual([48, 32])
+    const water = colorAt(mesh, far[0])
+    expect(water[0]).toBeCloseTo(0.24, 6)
+    expect(water[1]).toBeCloseTo(0.46, 6)
+    expect(water[2]).toBeCloseTo(0.89, 6)
+  })
+
+  it('keeps tint and alpha segmentation on merged quads', () => {
+    resetTintColors()
+    const grass = meshOf(['minecraft:grass_block'], [['aa']])
+    // Grass textures are opaque: all six merged faces land in opaque.
+    expect(grass.ranges.opaque.count).toBe(36)
+    expect(grass.ranges.cutout.count).toBe(0)
+    const up = vertexAt(grass, [2, 1, 1], [0, 1, 0])[0]
+    expect(colorAt(grass, up)[0]).toBeCloseTo(124 / 255, 6)
+    expect(colorAt(grass, up)[1]).toBeCloseTo(189 / 255, 6)
+    expect(colorAt(grass, up)[2]).toBeCloseTo(108 / 255, 6)
+    // The untinted dirt down face keeps the 0.5 down light.
+    const down = vertexAt(grass, [2, 0, 1], [0, -1, 0])[0]
+    expect(colorAt(grass, down)[0]).toBeCloseTo(0.5, 6)
+
+    const leaves = meshOf(['minecraft:oak_leaves'], [['aa']])
+    expect(leaves.ranges.cutout.count).toBe(36) // cutout alpha class kept
+    expect(leaves.ranges.translucent.count).toBe(0)
+  })
+
+  it('does not merge across different palette states', () => {
+    const mesh = meshOf(['minecraft:stone', 'minecraft:grass_block'], [['ab']])
+    // Two different blocks: the shared interior pair is culled and each
+    // direction stays two single-width runs.
+    expect(mesh.faceCount).toBe(10)
+    expect(mesh.ranges.opaque.count).toBe(60)
   })
 })

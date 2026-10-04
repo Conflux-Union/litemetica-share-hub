@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { AssetBundle } from '../types'
 import {
   buildTileTransforms,
+  computeAtlasUv,
   makeLookups,
   normalizeBlockStates,
   normalizeModel,
@@ -156,5 +157,41 @@ describe('normalized assets feed resolveStateGeometry', () => {
     expect(geo.quads).toHaveLength(6)
     // The sprite object must have resolved to the literal texture id.
     expect(geo.quads.every((q) => q.texture === 'minecraft:block/stone')).toBe(true)
+  })
+})
+
+describe('computeAtlasUv (tiled-uv parity with the affine tile transform)', () => {
+  // Same fixture shape surface.test.ts uses: one tile spanning the atlas
+  // quadrant [0.25,0.75] × [0.75,0.25].
+  const TILE = { u0: 0.25, du: 0.5 / 16, v0: 0.75, dv: -0.5 / 16 }
+  const span = TILE.du * 16
+  const oldU = (modelU: number): number => TILE.u0 + TILE.du * modelU
+  const oldV = (modelV: number): number => TILE.v0 + TILE.dv * modelV
+
+  /** 0 and 16 are tile boundaries (≤1e-3), 8 is interior (≤1e-4), and
+   * 32.5 wraps past one tile so it compares against the wrapped old
+   * formula (32.5 mod 16 = 0.5, boundary tolerance). */
+  const cases: { t: number; tol: number; wrap: boolean }[] = [
+    { t: 0, tol: 1e-3, wrap: false },
+    { t: 8, tol: 1e-4, wrap: false },
+    { t: 16, tol: 1e-3, wrap: false },
+    { t: 32.5, tol: 1e-3, wrap: true },
+  ]
+
+  it('stays within the old affine mapping inside one tile and wraps cleanly past it', () => {
+    for (const { t, tol, wrap } of cases) {
+      const oldT = wrap ? t % 16 : t
+      const [u, v] = computeAtlasUv(TILE, [t, t], span)
+      expect(Math.abs(u - oldU(oldT))).toBeLessThanOrEqual(tol)
+      expect(Math.abs(v - oldV(oldT))).toBeLessThanOrEqual(tol)
+    }
+  })
+
+  it('samples one texel inside the tile edge at the wrap seam', () => {
+    // Exactly on a block boundary the wrapped coordinate sits just below
+    // 1.0 of the tile span, never on the neighboring tile's first texel.
+    const [u] = computeAtlasUv(TILE, [16, 16], span)
+    expect(u).toBeLessThan(TILE.u0 + span)
+    expect(u).toBeGreaterThan(TILE.u0 + span - 1 / 128)
   })
 })

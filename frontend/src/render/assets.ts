@@ -46,6 +46,35 @@ export interface AssetStore {
   tintColors: { grass: Rgb; foliage: Rgb }
 }
 
+/** Normalized span of one atlas tile (u and v alike), derived from the
+ * same inset formula {@link buildTileTransforms} bakes into every tile. */
+export function atlasTileSpan(bundle: AssetBundle): number {
+  const tile = bundle.tile > 0 ? bundle.tile : 16
+  const ts = 1 / bundle.grid
+  const inset = 0.5 / (bundle.grid * tile)
+  return ts - 2 * inset
+}
+
+/**
+ * CPU parity check for the tiled-atlas fragment sampling (Viewer3D.vue /
+ * render/tiledMaterial): wrap a local 0..16 texel uv into one tile and
+ * offset it by the per-vertex tile origin. `fract(l/16 * (1 - 1e-4))`
+ * keeps samples just inside the tile edge; the per-period inset accumulates
+ * a sub-texel drift over long merged runs, which nearest filtering hides.
+ */
+export function computeAtlasUv(
+  tileOrigin: { u0: number; v0: number },
+  localUv: readonly [number, number],
+  span: number,
+): [number, number] {
+  const fract = (t: number): number => t - Math.floor(t)
+  const shrink = 1 - 1e-4
+  return [
+    tileOrigin.u0 + fract((localUv[0] / 16) * shrink) * span,
+    tileOrigin.v0 - fract((localUv[1] / 16) * shrink) * span,
+  ]
+}
+
 /**
  * Map bundle blockstate keys ("minecraft:block/<name>") to state-name keys
  * ("minecraft:<name>") so resolveStateGeometry finds them by state name;

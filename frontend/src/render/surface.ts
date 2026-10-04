@@ -1,17 +1,29 @@
 /**
- * Neighbor-aware surface mesher (plan §5 P2.4).
+ * Neighbor-aware surface mesher (plan §5 P2.4) with greedy face merging.
  *
- * Per voxel the cached per-state quad templates (render/model) are
- * instantiated into world space. Faces declared with `cullface` are dropped
- * when the neighbor in that direction is a full-cube occluder or belongs to
- * the same cull group (glass / ice / slime+honey / leaves / water — research
- * §3); non-cube blocks never occlude neighbors. Classic per-vertex ambient
- * occlusion samples full-cube neighbors only, and the quad diagonal flips to
- * follow the AO gradient. Face-direction shade × AO × per-face tint
- * (tintindex gate, render/tint) is baked into vertex colors. Quads are
- * bucketed by their texture's alpha class into three draw ranges plus an
- * untextured `flat` range for magenta placeholders and the no-bundle
- * fallback.
+ * Mergeable states — vanilla full-cube models, the synthesized water cube
+ * and the no-bundle fallback — are meshed by six directional mask scans:
+ * visible faces of one palette entry whose outside cell has no AO occluder
+ * in its 3x3 neighborhood merge into maximal rectangles (one quad per run;
+ * tint and face shade are uniform because the palette entry is uniform),
+ * while AO-shadowed faces fall back to the per-face path (vertex AO +
+ * diagonal flip) inside the same scan. Every face is emitted exactly once;
+ * the scans never re-emit what the template path draws.
+ *
+ * Everything else — stairs, walls, panes, torches, cross plants, magenta
+ * placeholders — keeps the per-voxel template path: cached per-state quad
+ * templates (render/model) instantiated into world space, faces with
+ * `cullface` dropped against full-cube occluders or same cull-group
+ * neighbors (glass / ice / slime+honey / leaves / water — research §3),
+ * classic per-vertex ambient occlusion from full-cube neighbors with the
+ * quad diagonal following the AO gradient, and face-direction shade × AO ×
+ * per-face tint (tintindex gate, render/tint) baked into vertex colors.
+ *
+ * Quads are bucketed by their texture's alpha class into three draw ranges
+ * plus an untextured `flat` range. UVs stay in the model's local 0..16
+ * texel space and carry a per-vertex tile origin; the viewer materials
+ * wrap them into the atlas per fragment (render/tiledMaterial), so merged
+ * quads tile their texture every block instead of stretching it.
  */
 
 import { blockColor } from './colors'
@@ -21,6 +33,7 @@ import {
   parseState,
   resolveStateGeometry,
   stateGeometryCache,
+  type BlockState,
   type FaceDir,
   type Quad,
   type StateGeometry,
@@ -58,7 +71,12 @@ export interface MeshRanges {
 export interface MeshData {
   positions: Float32Array
   normals: Float32Array
+  /** Local 0..16 texel-space uvs (unmerged faces carry the template's
+   * values verbatim; merged faces span 0..16*w × 0..16*h). */
   uvs: Float32Array
+  /** Per-vertex atlas tile origin (u0, v0) paired with `uvs`; the viewer
+   * materials wrap localUv into this tile per fragment. */
+  tileOrigins: Float32Array
   colors: Float32Array
   indices: Uint32Array
   /** Contiguous index ranges, in order opaque → cutout → translucent → flat. */
@@ -91,6 +109,10 @@ const AIR_NAMES = new Set(['minecraft:air', 'minecraft:cave_air', 'minecraft:voi
  * strength table [1, 0.7, 0.5, 0.2]. */
 const AO_STRENGTH = [1, 0.7, 0.5, 0.2] as const
 
+/** Hard cap on emitted quads: beyond this the vertex buffers alone would
+ * exhaust a browser tab (decode.ts guards the voxel count upstream). */
+const MAX_QUADS = 16_000_000
+
 const WHITE: Rgb = [1, 1, 1]
 const MAGENTA: Rgb = [1, 0, 1]
 
@@ -106,7 +128,7 @@ function faceLight(normal: readonly number[]): number {
 }
 
 // ---------------------------------------------------------------------------
-// Synthesized cube templates (placeholder / water / flat fallback)
+// Synthesized cube templates (water / placeholder / flat fallback)
 // ---------------------------------------------------------------------------
 
 interface CubeFace {
@@ -150,6 +172,38 @@ const CUBE_FACES: CubeFace[] = [
   },
 ]
 
+/** Position of each direction inside CUBE_FACES (the greedy-scan order). */
+const DIR_INDEX: Record<FaceDir, number> = { up: 0, down: 1, north: 2, south: 3, west: 4, east: 5 }
+
+/** Scan geometry per CUBE_FACES entry: `d` slides along the normal axis,
+ * `u` runs along the mask row (fastest), `v` down the mask column. The uv
+ * axes of every CUBE_FACES table track the same axes (u↔`u`, v↔`v`), so a
+ * merged rect scales uv u by w and uv v by h whatever the mirroring. */
+interface ScanAxes {
+  d: 0 | 1 | 2
+  u: 0 | 1 | 2
+  v: 0 | 1 | 2
+}
+
+const DIR_SCAN: ScanAxes[] = [
+  { d: 1, u: 0, v: 2 }, // up: plane (x, z)
+  { d: 1, u: 0, v: 2 }, // down
+  { d: 2, u: 0, v: 1 }, // north: plane (x, y)
+  { d: 2, u: 0, v: 1 }, // south
+  { d: 0, u: 2, v: 1 }, // west: plane (z, y)
+  { d: 0, u: 2, v: 1 }, // east
+]
+
+/** In-plane unit offsets per scan direction — the tangent pair vertexAo
+ * samples around the outside cell (up/down: x,z; north/south: x,y;
+ * west/east: y,z). */
+const SCAN_T1: readonly [number, number, number][] = DIR_SCAN.map((s) =>
+  s.d === 0 ? [0, 1, 0] : [1, 0, 0],
+)
+const SCAN_T2: readonly [number, number, number][] = DIR_SCAN.map((s) =>
+  s.d === 2 ? [0, 1, 0] : [0, 0, 1],
+)
+
 /** Full-cube quad template with a cullface per direction. */
 function cubeTemplate(texture: string, tintindex?: number): Quad[] {
   return CUBE_FACES.map((f) => ({
@@ -170,15 +224,31 @@ const WATER_QUADS = cubeTemplate('minecraft:block/water_still', 0)
 const FALLBACK_QUADS = cubeTemplate('')
 
 // ---------------------------------------------------------------------------
-// Per-palette-entry templates
+// Per-palette-entry classification
 // ---------------------------------------------------------------------------
+
+/** One mergeable cube face, resolved once per palette entry: the template
+ * quad for per-face (AO-shadowed) emission plus its baked material info. */
+interface FaceInfo {
+  quad: Quad
+  tint: Rgb | null
+  tile: TileTransform | null
+  segment: SegmentName
+  /** Vertex color when the texture is absent (magenta / fallback / water). */
+  flat: Rgb | null
+}
 
 interface VoxelTemplate {
   /** Assets lack this state: render the magenta placeholder cube. */
   placeholder: boolean
+  /** Template-path quads (empty when the greedy scan covers this state). */
   quads: Quad[]
-  /** Synthesized water cube (water block or waterlogged state). */
-  water: Quad[] | null
+  /** Greedy-mergeable block faces per CUBE_FACES direction; null when the
+   * model is not a plain full cube (stairs, panes, plants, …). */
+  faces: FaceInfo[] | null
+  /** Synthesized water cube (water block or waterlogged state), always
+   * greedy-mergeable; null without water. */
+  waterFaces: FaceInfo[] | null
   /** Hides neighbors' culled faces: full-cube shape outside cull groups. */
   occludesFaces: boolean
   /** Darkens neighbor vertices via AO: full-cube shape. */
@@ -207,64 +277,91 @@ function warnTexture(textureId: string): void {
   console.warn(`[render] texture "${textureId}" is not in the atlas; rendering magenta`)
 }
 
-function buildTemplate(
-  stateKey: string,
-  store: SurfaceAssets | null,
-  cache: Map<string, StateGeometry>,
-): VoxelTemplate {
-  if (!store) {
-    // No bundle: flat-colored full cubes (blockColor strips state strings).
-    return {
-      placeholder: false,
-      quads: FALLBACK_QUADS,
-      water: null,
-      occludesFaces: true,
-      occludesAo: true,
-      group: undefined,
-      hasWater: false,
-      name: '',
-      props: {},
-      color: blockColor(stateKey),
+/** True when a full-cube model compiles to exactly the six cube faces —
+ * one culled quad per direction whose uvs still cover the whole 0..16
+ * tile. Those faces are exactly what CUBE_FACES can rebuild merged;
+ * explicit uv sub-rects or missing cullfaces stay on the template path. */
+function mergeableCube(quads: Quad[]): boolean {
+  if (quads.length !== 6) return false
+  const seen = new Set<FaceDir>()
+  for (const q of quads) {
+    if (q.cullface === undefined || seen.has(q.cullface)) return false
+    seen.add(q.cullface)
+    let combos = 0
+    for (const uv of q.uvs) {
+      const uEdge = uv[0] <= 1e-6 ? 0 : uv[0] >= 16 - 1e-6 ? 1 : -1
+      const vEdge = uv[1] <= 1e-6 ? 0 : uv[1] >= 16 - 1e-6 ? 1 : -1
+      if (uEdge < 0 || vEdge < 0) return false
+      combos |= 1 << (uEdge | (vEdge << 1))
     }
+    if (combos !== 0b1111) return false
   }
-
-  const geo = resolveStateGeometry(stateKey, store.assets, cache)
-  const state = parseState(geo.stateKey)
-  const group = cullGroup(state.name)
-  const isWater = WATER_NAMES.has(state.name)
-  const waterlogged = state.props.waterlogged === 'true'
-  if (geo.missing) warnPlaceholder(geo.stateKey)
-
-  return {
-    placeholder: geo.missing,
-    quads: geo.missing ? [] : geo.quads,
-    water: isWater || waterlogged ? WATER_QUADS : null,
-    // Glass/ice/… keep their faces against non-group neighbors, so only
-    // cull-group-free full cubes hide neighboring faces.
-    occludesFaces: geo.fullCube && group === undefined,
-    occludesAo: geo.fullCube,
-    group,
-    hasWater: isWater || waterlogged,
-    name: state.name,
-    props: state.props,
-    color: [1, 1, 1],
-  }
+  return true
 }
 
 // ---------------------------------------------------------------------------
-// Mesher
+// Typed mesh builders (capacity-doubling channels)
 // ---------------------------------------------------------------------------
 
+/** Growable Float32Array channel; `length` counts live components. */
+class FloatChannel {
+  data = new Float32Array(1 << 14)
+  length = 0
+
+  /** Ensure room for `n` more components, doubling until it fits. */
+  reserve(n: number): void {
+    const need = this.length + n
+    if (need <= this.data.length) return
+    let cap = this.data.length * 2
+    while (cap < need) cap *= 2
+    const next = new Float32Array(cap)
+    next.set(this.view())
+    this.data = next
+  }
+
+  view(): Float32Array {
+    return this.data.subarray(0, this.length)
+  }
+}
+
+/** Growable Uint32Array channel for the index buffer. */
+class IndexChannel {
+  data = new Uint32Array(1 << 14)
+  length = 0
+
+  reserve(n: number): void {
+    const need = this.length + n
+    if (need <= this.data.length) return
+    let cap = this.data.length * 2
+    while (cap < need) cap *= 2
+    const next = new Uint32Array(cap)
+    next.set(this.view())
+    this.data = next
+  }
+
+  view(): Uint32Array {
+    return this.data.subarray(0, this.length)
+  }
+}
+
 interface Builder {
-  positions: number[]
-  normals: number[]
-  uvs: number[]
-  colors: number[]
-  indices: number[]
+  positions: FloatChannel
+  normals: FloatChannel
+  uvs: FloatChannel
+  tileOrigins: FloatChannel
+  colors: FloatChannel
+  indices: IndexChannel
 }
 
 function newBuilder(): Builder {
-  return { positions: [], normals: [], uvs: [], colors: [], indices: [] }
+  return {
+    positions: new FloatChannel(),
+    normals: new FloatChannel(),
+    uvs: new FloatChannel(),
+    tileOrigins: new FloatChannel(),
+    colors: new FloatChannel(),
+    indices: new IndexChannel(),
+  }
 }
 
 const SEGMENT_ORDER: SegmentName[] = ['opaque', 'cutout', 'translucent', 'flat']
@@ -285,15 +382,105 @@ export function extractSurface(
   cache: Map<string, StateGeometry> = stateGeometryCache,
 ): MeshData {
   const [dx, dy, dz] = grid.dims
+  const dims = [dx, dy, dz] as const
+  /** Index strides per axis for data[y*dz*dx + z*dx + x]. */
+  const strideAxis = [1, dx * dz, dx] as const
   const at = (x: number, y: number, z: number): number => {
     if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return -1
-    return grid.data[y * dz * dx + z * dx + x]
+    return grid.data[y * dx * dz + z * dx + x]
+  }
+
+  /** Texture lookup with the model layer's namespace tolerance: 26.x model
+   * JSON carries bare texture ids ("block/snow") while atlas keys are
+   * namespaced ("minecraft:block/snow"). */
+  const resolveTexture = (textureId: string): { id: string; tile: TileTransform | null } => {
+    const tile = store?.tileTransform(textureId) ?? null
+    if (tile || textureId.includes(':')) return { id: textureId, tile }
+    const namespaced = `minecraft:${textureId}`
+    const nsTile = store?.tileTransform(namespaced) ?? null
+    return { id: nsTile ? namespaced : textureId, tile: nsTile }
+  }
+
+  /** Per-direction face infos for a six-quad cube template (indexed by
+   * CUBE_FACES position via each quad's cullface). */
+  const buildFaces = (
+    quads: Quad[],
+    state: BlockState,
+    flatOf: (tint: Rgb | null) => Rgb | null,
+    warnMissing: boolean,
+  ): FaceInfo[] => {
+    const faces: FaceInfo[] = new Array(6)
+    for (const q of quads) {
+      const tint = resolveTint(state.name, state.props, q.tintindex)
+      const { id, tile } = resolveTexture(q.texture)
+      if (!tile && warnMissing) warnTexture(q.texture)
+      faces[DIR_INDEX[q.cullface!]] = {
+        quad: q,
+        tint,
+        tile,
+        segment: tile ? segmentOfAlpha(store?.alphaClass(id) ?? 'opaque') : 'flat',
+        flat: flatOf(tint),
+      }
+    }
+    return faces
   }
 
   // One template per palette entry; air variants mesh as empty.
   const templates: (VoxelTemplate | null)[] = grid.palette.map((stateKey, i) => {
     if (i === 0 || AIR_NAMES.has(parseState(stateKey).name)) return null
-    return buildTemplate(stateKey, store, cache)
+
+    if (!store) {
+      // No bundle: flat-colored full cubes (blockColor strips state strings).
+      const color = blockColor(stateKey)
+      return {
+        placeholder: false,
+        quads: [],
+        faces: FALLBACK_QUADS.map((q) => ({
+          quad: q,
+          tint: null,
+          tile: null,
+          segment: 'flat',
+          flat: color,
+        })),
+        waterFaces: null,
+        occludesFaces: true,
+        occludesAo: true,
+        group: undefined,
+        hasWater: false,
+        name: '',
+        props: {},
+        color,
+      }
+    }
+
+    const geo = resolveStateGeometry(stateKey, store.assets, cache)
+    const state = parseState(geo.stateKey)
+    const group = cullGroup(state.name)
+    const isWater = WATER_NAMES.has(state.name)
+    const waterlogged = state.props.waterlogged === 'true'
+    if (geo.missing) warnPlaceholder(geo.stateKey)
+
+    const mergeable = !geo.missing && mergeableCube(geo.quads)
+    return {
+      placeholder: geo.missing,
+      quads: geo.missing || mergeable ? [] : geo.quads,
+      faces: mergeable ? buildFaces(geo.quads, state, () => null, true) : null,
+      // Water cubes carry tintindex 0 → the constant water blue; a missing
+      // water texture degrades silently to the flat water tint, not magenta.
+      waterFaces:
+        isWater || waterlogged
+          ? buildFaces(WATER_QUADS, state, (tint) => tint ?? MAGENTA, false)
+          : null,
+      // Glass/ice/… keep their faces against non-group neighbors, so only
+      // cull-group-free full cubes hide neighboring faces.
+      occludesFaces: geo.fullCube && group === undefined,
+      occludesAo: geo.fullCube,
+      group,
+      hasWater: isWater || waterlogged,
+      name: state.name,
+      props: state.props,
+      color: [1, 1, 1],
+    }
   })
 
   const buckets: Record<SegmentName, Builder> = {
@@ -328,15 +515,30 @@ export function extractSurface(
     return nb.occludesFaces || nb.hasWater
   }
 
-  /** Texture lookup with the model layer's namespace tolerance: 26.x model
-   * JSON carries bare texture ids ("block/snow") while atlas keys are
-   * namespaced ("minecraft:block/snow"). */
-  const resolveTexture = (textureId: string): { id: string; tile: TileTransform | null } => {
-    const tile = store?.tileTransform(textureId) ?? null
-    if (tile || textureId.includes(':')) return { id: textureId, tile }
-    const namespaced = `minecraft:${textureId}`
-    const nsTile = store?.tileTransform(namespaced) ?? null
-    return { id: nsTile ? namespaced : textureId, tile: nsTile }
+  /** A face may merge only when every corner AO is 1: no occludesAo voxel
+   * anywhere in the 3x3 neighborhood of the outside cell (water quads skip
+   * this check — water never receives AO). */
+  const faceAoClean = (x: number, y: number, z: number, dirIdx: number): boolean => {
+    const n = FACE_NORMALS[CUBE_FACES[dirIdx].dir]
+    const e1 = SCAN_T1[dirIdx]
+    const e2 = SCAN_T2[dirIdx]
+    const bx = x + n[0]
+    const by = y + n[1]
+    const bz = z + n[2]
+    for (let du = -1; du <= 1; du++) {
+      for (let dv = -1; dv <= 1; dv++) {
+        if (
+          aoOccluder(
+            bx + du * e1[0] + dv * e2[0],
+            by + du * e1[1] + dv * e2[1],
+            bz + du * e1[2] + dv * e2[2],
+          )
+        ) {
+          return false
+        }
+      }
+    }
+    return true
   }
 
   /** Per-vertex AO from the full-cube neighbors around the face's outside
@@ -374,6 +576,11 @@ export function extractSurface(
     return ao
   }
 
+  let quadBudget = 0
+  const spendQuad = (): void => {
+    if (++quadBudget > MAX_QUADS) throw new Error('原理图过大,无法在浏览器中生成预览')
+  }
+
   const pushQuad = (
     bucket: Builder,
     wx: number,
@@ -385,31 +592,241 @@ export function extractSurface(
     ao: number[] | null,
     flat: Rgb | null,
   ): void => {
+    spendQuad()
     const base = bucket.positions.length / 3
     const light = faceLight(quad.normal)
     const color = tile ? (tint ?? WHITE) : (flat ?? MAGENTA)
+    const pos = bucket.positions
+    const nrm = bucket.normals
+    const uv = bucket.uvs
+    const org = bucket.tileOrigins
+    const col = bucket.colors
+    pos.reserve(12)
+    nrm.reserve(12)
+    uv.reserve(8)
+    org.reserve(8)
+    col.reserve(12)
     for (let i = 0; i < 4; i++) {
       const p = quad.positions[i]
-      bucket.positions.push(wx + p[0], wy + p[1], wz + p[2])
-      bucket.normals.push(quad.normal[0], quad.normal[1], quad.normal[2])
+      pos.data[pos.length++] = wx + p[0]
+      pos.data[pos.length++] = wy + p[1]
+      pos.data[pos.length++] = wz + p[2]
+      nrm.data[nrm.length++] = quad.normal[0]
+      nrm.data[nrm.length++] = quad.normal[1]
+      nrm.data[nrm.length++] = quad.normal[2]
+      // Local texel-space uv (atlas wrapping happens per fragment); the
+      // tile origin rides along as a second attribute.
       if (tile) {
-        bucket.uvs.push(
-          tile.u0 + tile.du * quad.uvs[i][0],
-          tile.v0 + tile.dv * quad.uvs[i][1],
-        )
+        uv.data[uv.length++] = quad.uvs[i][0]
+        uv.data[uv.length++] = quad.uvs[i][1]
+        org.data[org.length++] = tile.u0
+        org.data[org.length++] = tile.v0
       } else {
-        bucket.uvs.push(0, 0)
+        uv.data[uv.length++] = 0
+        uv.data[uv.length++] = 0
+        org.data[org.length++] = 0
+        org.data[org.length++] = 0
       }
       const v = light * (ao ? ao[i] : 1)
-      bucket.colors.push(color[0] * v, color[1] * v, color[2] * v)
+      col.data[col.length++] = color[0] * v
+      col.data[col.length++] = color[1] * v
+      col.data[col.length++] = color[2] * v
     }
+    const idx = bucket.indices
+    idx.reserve(6)
     // Flip the shared diagonal toward the brighter pair to hide AO seams.
     if (ao && ao[0] + ao[2] < ao[1] + ao[3]) {
-      bucket.indices.push(base + 1, base + 2, base + 3, base + 1, base + 3, base)
+      idx.data[idx.length++] = base + 1
+      idx.data[idx.length++] = base + 2
+      idx.data[idx.length++] = base + 3
+      idx.data[idx.length++] = base + 1
+      idx.data[idx.length++] = base + 3
+      idx.data[idx.length++] = base
     } else {
-      bucket.indices.push(base, base + 1, base + 2, base, base + 2, base + 3)
+      idx.data[idx.length++] = base
+      idx.data[idx.length++] = base + 1
+      idx.data[idx.length++] = base + 2
+      idx.data[idx.length++] = base
+      idx.data[idx.length++] = base + 2
+      idx.data[idx.length++] = base + 3
     }
   }
+
+  /** One AO-shadowed greedy cell: today's per-face emission, verbatim. */
+  const emitScanFace = (info: FaceInfo, x: number, y: number, z: number): void => {
+    pushQuad(
+      buckets[info.segment],
+      x,
+      y,
+      z,
+      info.quad,
+      info.tile,
+      info.tint,
+      vertexAo(info.quad, x, y, z),
+      info.flat,
+    )
+  }
+
+  /** One merged rectangle: CUBE_FACES corner/uv topology with the in-plane
+   * offsets and uv values scaled by w/h; constant normal, face light × tint
+   * (AO is 1 by the merge precondition). */
+  const emitMerged = (
+    info: FaceInfo,
+    dirIdx: number,
+    a0: number,
+    b0: number,
+    s: number,
+    w: number,
+    h: number,
+  ): void => {
+    spendQuad()
+    const face = CUBE_FACES[dirIdx]
+    const scan = DIR_SCAN[dirIdx]
+    const ua = scan.u
+    const va = scan.v
+    const normal = FACE_NORMALS[face.dir]
+    const light = faceLight(normal)
+    const color = info.tile ? (info.tint ?? WHITE) : (info.flat ?? MAGENTA)
+    const bucket = buckets[info.segment]
+    const pos = bucket.positions
+    const nrm = bucket.normals
+    const uv = bucket.uvs
+    const org = bucket.tileOrigins
+    const col = bucket.colors
+    const base = pos.length / 3
+    pos.reserve(12)
+    nrm.reserve(12)
+    uv.reserve(8)
+    org.reserve(8)
+    col.reserve(12)
+    for (let i = 0; i < 4; i++) {
+      const c = face.corners[i]
+      const cu = c[ua]
+      const cv = c[va]
+      const cd = c[scan.d]
+      pos.data[pos.length++] = ua === 0 ? a0 + cu * w : va === 0 ? b0 + cv * h : s + cd
+      pos.data[pos.length++] = ua === 1 ? a0 + cu * w : va === 1 ? b0 + cv * h : s + cd
+      pos.data[pos.length++] = ua === 2 ? a0 + cu * w : va === 2 ? b0 + cv * h : s + cd
+      nrm.data[nrm.length++] = normal[0]
+      nrm.data[nrm.length++] = normal[1]
+      nrm.data[nrm.length++] = normal[2]
+      // Local texel space: the 0/16 corner values scale to 0..16w / 0..16h
+      // so the tiled-UV materials repeat the tile every block.
+      uv.data[uv.length++] = face.uvs[i][0] * w
+      uv.data[uv.length++] = face.uvs[i][1] * h
+      if (info.tile) {
+        org.data[org.length++] = info.tile.u0
+        org.data[org.length++] = info.tile.v0
+      } else {
+        org.data[org.length++] = 0
+        org.data[org.length++] = 0
+      }
+      col.data[col.length++] = color[0] * light
+      col.data[col.length++] = color[1] * light
+      col.data[col.length++] = color[2] * light
+    }
+    const idx = bucket.indices
+    idx.reserve(6)
+    idx.data[idx.length++] = base
+    idx.data[idx.length++] = base + 1
+    idx.data[idx.length++] = base + 2
+    idx.data[idx.length++] = base
+    idx.data[idx.length++] = base + 2
+    idx.data[idx.length++] = base + 3
+  }
+
+  // -------------------------------------------------------------------------
+  // Greedy scans: six directions × (block pass + water pass). Positive mask
+  // values are mergeable palette indices, negatives mark AO-shadowed cells
+  // that emit immediately, 0 is nothing. Sweeps clear every non-zero cell,
+  // so the masks start zeroed for the next slice.
+  // -------------------------------------------------------------------------
+
+  for (let dirIdx = 0; dirIdx < 6; dirIdx++) {
+    const scan = DIR_SCAN[dirIdx]
+    const ua = scan.u
+    const va = scan.v
+    const da = scan.d
+    const dir = CUBE_FACES[dirIdx].dir
+    const nu = dims[ua]
+    const nv = dims[va]
+    const nd = dims[da]
+    const strideU = strideAxis[ua]
+    const strideV = strideAxis[va]
+    const strideD = strideAxis[da]
+    const blockMask = new Int32Array(nu * nv)
+    const waterMask = new Int32Array(nu * nv)
+
+    /** Standard maximal-rectangle sweep; AO-shadowed cells emit alone via
+     * the per-face path (vertex AO, diagonal flip). */
+    const sweep = (mask: Int32Array, water: boolean, s: number): void => {
+      for (let b = 0; b < nv; b++) {
+        const row = b * nu
+        for (let a = 0; a < nu; ) {
+          const v = mask[row + a]
+          if (v === 0) {
+            a++
+            continue
+          }
+          const pi = v > 0 ? v : -v
+          const info = (water ? templates[pi]!.waterFaces : templates[pi]!.faces)![dirIdx]
+          if (v < 0) {
+            emitScanFace(info, ua === 0 ? a : va === 0 ? b : s, ua === 1 ? a : va === 1 ? b : s, ua === 2 ? a : va === 2 ? b : s)
+            mask[row + a] = 0
+            a++
+            continue
+          }
+          let w = 1
+          while (a + w < nu && mask[row + a + w] === v) w++
+          let h = 1
+          grow: while (b + h < nv) {
+            const below = (b + h) * nu + a
+            for (let k = 0; k < w; k++) {
+              if (mask[below + k] !== v) break grow
+            }
+            h++
+          }
+          emitMerged(info, dirIdx, a, b, s, w, h)
+          for (let bb = 0; bb < h; bb++) {
+            const clear = (b + bb) * nu + a
+            for (let k = 0; k < w; k++) mask[clear + k] = 0
+          }
+          a += w
+        }
+      }
+    }
+
+    for (let s = 0; s < nd; s++) {
+      // Fill both masks for this slice (air leaves the previous zeros).
+      const sliceOff = s * strideD
+      let m = 0
+      for (let b = 0; b < nv; b++) {
+        const rowOff = sliceOff + b * strideV
+        for (let a = 0; a < nu; a++, m++) {
+          const pi = grid.data[rowOff + a * strideU]
+          const rec = templates[pi]
+          if (rec === null) continue
+          const x = ua === 0 ? a : va === 0 ? b : s
+          const y = ua === 1 ? a : va === 1 ? b : s
+          const z = ua === 2 ? a : va === 2 ? b : s
+          if (rec.faces !== null && !culled(x, y, z, dir, rec.group)) {
+            blockMask[m] = faceAoClean(x, y, z, dirIdx) ? pi : -pi
+          }
+          if (rec.waterFaces !== null && !waterCulled(x, y, z, dir)) {
+            waterMask[m] = pi
+          }
+        }
+      }
+      sweep(blockMask, false, s)
+      sweep(waterMask, true, s)
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Template path: non-cube models and placeholders, per voxel. Mergeable
+  // states carry empty `quads` (the scans above emitted their faces), and
+  // the no-bundle fallback is fully greedy, so this loop is store-only.
+  // -------------------------------------------------------------------------
 
   const emitPlaceholder = (x: number, y: number, z: number): void => {
     for (const q of PLACEHOLDER_QUADS) {
@@ -420,31 +837,21 @@ export function extractSurface(
 
   for (let y = 0; y < dy; y++) {
     for (let z = 0; z < dz; z++) {
+      const rowOff = (y * dz + z) * dx
       for (let x = 0; x < dx; x++) {
-        const rec = templates[grid.data[y * dz * dx + z * dx + x]]
+        const rec = templates[grid.data[rowOff + x]]
         if (!rec) continue
-
-        if (!store) {
-          // No-bundle fallback: full cubes, block colors baked per vertex.
-          for (const q of rec.quads) {
-            if (q.cullface && culled(x, y, z, q.cullface, rec.group)) continue
-            pushQuad(buckets.flat, x, y, z, q, null, null, vertexAo(q, x, y, z), rec.color)
-          }
-          continue
-        }
-
         if (rec.placeholder) {
           emitPlaceholder(x, y, z)
           continue
         }
-
         for (const q of rec.quads) {
           if (q.cullface && culled(x, y, z, q.cullface, rec.group)) continue
           const tint = resolveTint(rec.name, rec.props, q.tintindex)
           const { id, tile } = resolveTexture(q.texture)
           if (tile) {
             pushQuad(
-              buckets[segmentOfAlpha(store.alphaClass(id))],
+              buckets[segmentOfAlpha(store ? store.alphaClass(id) : 'opaque')],
               x,
               y,
               z,
@@ -460,66 +867,56 @@ export function extractSurface(
             pushQuad(buckets.flat, x, y, z, q, null, null, vertexAo(q, x, y, z), MAGENTA)
           }
         }
-
-        if (rec.water) {
-          for (const q of rec.water) {
-            if (q.cullface && waterCulled(x, y, z, q.cullface)) continue
-            const tint = resolveTint(rec.name, rec.props, q.tintindex)
-            const { id, tile } = resolveTexture(q.texture)
-            // Water never receives AO; a missing water texture degrades to
-            // the flat water tint rather than magenta.
-            pushQuad(
-              tile ? buckets[segmentOfAlpha(store.alphaClass(id))] : buckets.flat,
-              x,
-              y,
-              z,
-              q,
-              tile,
-              tint,
-              null,
-              tint,
-            )
-          }
-        }
       }
     }
   }
 
   // Concatenate buckets in fixed order, remapping indices per vertex base.
   const totalVerts =
-    (buckets.opaque.positions.length +
-      buckets.cutout.positions.length +
-      buckets.translucent.positions.length +
-      buckets.flat.positions.length) /
-    3
-  const totalIndices =
-    buckets.opaque.indices.length +
-    buckets.cutout.indices.length +
-    buckets.translucent.indices.length +
-    buckets.flat.indices.length
+    buckets.opaque.positions.length / 3 +
+    buckets.cutout.positions.length / 3 +
+    buckets.translucent.positions.length / 3 +
+    buckets.flat.positions.length / 3
 
   const positions = new Float32Array(totalVerts * 3)
   const normals = new Float32Array(totalVerts * 3)
   const uvs = new Float32Array(totalVerts * 2)
+  const tileOrigins = new Float32Array(totalVerts * 2)
   const colors = new Float32Array(totalVerts * 3)
-  const indices = new Uint32Array(totalIndices)
+  const indices = new Uint32Array(
+    buckets.opaque.indices.length +
+      buckets.cutout.indices.length +
+      buckets.translucent.indices.length +
+      buckets.flat.indices.length,
+  )
 
   const ranges = {} as MeshRanges
   let vertOffset = 0
   let indexOffset = 0
   for (const name of SEGMENT_ORDER) {
     const b = buckets[name]
-    positions.set(b.positions, vertOffset * 3)
-    normals.set(b.normals, vertOffset * 3)
-    uvs.set(b.uvs, vertOffset * 2)
-    colors.set(b.colors, vertOffset * 3)
-    for (let i = 0; i < b.indices.length; i++) {
-      indices[indexOffset + i] = b.indices[i] + vertOffset
+    positions.set(b.positions.view(), vertOffset * 3)
+    normals.set(b.normals.view(), vertOffset * 3)
+    uvs.set(b.uvs.view(), vertOffset * 2)
+    tileOrigins.set(b.tileOrigins.view(), vertOffset * 2)
+    colors.set(b.colors.view(), vertOffset * 3)
+    const src = b.indices.view()
+    for (let i = 0; i < src.length; i++) {
+      indices[indexOffset + i] = src[i] + vertOffset
     }
-    ranges[name] = { start: indexOffset, count: b.indices.length }
+    ranges[name] = { start: indexOffset, count: src.length }
     vertOffset += b.positions.length / 3
-    indexOffset += b.indices.length
+    indexOffset += src.length
   }
 
-  return { positions, normals, uvs, colors, indices, ranges, faceCount: totalIndices / 6 }
+  return {
+    positions,
+    normals,
+    uvs,
+    tileOrigins,
+    colors,
+    indices,
+    ranges,
+    faceCount: indices.length / 6,
+  }
 }
