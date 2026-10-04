@@ -194,11 +194,22 @@ fn parse_pipeline_roundtrip() {
     assert_eq!(by_id("minecraft:redstone"), Some(1));
     assert!(parsed.materials.iter().all(|m| !m.name_zh.is_empty()));
 
-    assert_eq!(parsed.preview.regions[0].size, [4, 3, 2]);
-    assert_eq!(
-        parsed.preview.regions[0].palette.len(),
-        schem.regions[0].block_palette().len()
-    );
+    // NBT compounds are unordered maps, and the writer serializes regions
+    // from a HashMap, so region order in the file (and thus in the preview)
+    // varies between runs. Locate regions by name, never by position.
+    let main = parsed
+        .preview
+        .regions
+        .iter()
+        .find(|r| r.name == "main")
+        .expect("main region present");
+    assert_eq!(main.size, [4, 3, 2]);
+    let schem_main = schem
+        .regions
+        .iter()
+        .find(|r| r.name == "main")
+        .expect("main region in fixture");
+    assert_eq!(main.palette.len(), schem_main.block_palette().len());
 
     // Binary roundtrip: serialize the preview into the schema-3 format and
     // decode it with the test-side reader. The wire payload must carry every
@@ -213,11 +224,17 @@ fn parse_pipeline_roundtrip() {
         assert_eq!(decoded.palette, region.palette);
         assert_eq!(decoded.rle, region.rle);
     }
-    assert_eq!(decoded[0].name, "main");
-    assert_eq!(decoded[1].name, "annex");
-    assert_eq!(decoded[1].pos, [6, 0, 3]);
-    assert_eq!(decoded[1].size, [-2, 2, -3]);
-    assert_eq!(decoded[1].palette, vec!["minecraft:air", "minecraft:stone"]);
+    let main = decoded
+        .iter()
+        .find(|r| r.name == "main")
+        .expect("main decoded");
+    let annex = decoded
+        .iter()
+        .find(|r| r.name == "annex")
+        .expect("annex decoded");
+    assert_eq!(annex.pos, [6, 0, 3]);
+    assert_eq!(annex.size, [-2, 2, -3]);
+    assert_eq!(annex.palette, vec!["minecraft:air", "minecraft:stone"]);
 
     // RLE roundtrip off the decoded bytes: expand and compare block-by-block
     // against the source region.
@@ -230,7 +247,7 @@ fn parse_pipeline_roundtrip() {
         }
         expanded
     };
-    let expanded = expand(&decoded[0]);
+    let expanded = expand(main);
     assert_eq!(expanded.len(), 4 * 3 * 2);
 
     // Iteration order is x fastest, then z, then y (litematica storage order).
@@ -250,10 +267,10 @@ fn parse_pipeline_roundtrip() {
 
     // The negative-size annex still carries |size| voxels: the stone at local
     // (0,0,0) followed by |size|-1 air blocks.
-    let annex = expand(&decoded[1]);
-    assert_eq!(annex.len(), 2 * 2 * 3);
-    assert_eq!(annex[0], "minecraft:stone");
-    assert!(annex[1..].iter().all(|s| s == "minecraft:air"));
+    let annex_blocks = expand(annex);
+    assert_eq!(annex_blocks.len(), 2 * 2 * 3);
+    assert_eq!(annex_blocks[0], "minecraft:stone");
+    assert!(annex_blocks[1..].iter().all(|s| s == "minecraft:air"));
 }
 
 #[test]
