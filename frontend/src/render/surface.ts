@@ -375,11 +375,17 @@ function segmentOfAlpha(alpha: AlphaClass): SegmentName {
  * per-alpha-class draw ranges. `store === null` keeps the flat-color
  * fallback (full cubes tinted with block colors). `cache` overrides the
  * shared state-geometry cache (tests pass isolated maps).
+ *
+ * `onProgress`, when given, receives a 0..1 fraction: once after the
+ * per-palette template build, then per swept slice of the six greedy
+ * scans and per y layer of the template pass — never per voxel. Omitting
+ * it keeps the callback-free path's behavior.
  */
 export function extractSurface(
   grid: VoxelGrid,
   store: SurfaceAssets | null,
   cache: Map<string, StateGeometry> = stateGeometryCache,
+  onProgress?: (fraction: number) => void,
 ): MeshData {
   const [dx, dy, dz] = grid.dims
   const dims = [dx, dy, dz] as const
@@ -482,6 +488,12 @@ export function extractSurface(
       color: [1, 1, 1],
     }
   })
+
+  // Progress phases: template build 0..2%, greedy scans 2..72%, template
+  // pass 72..100%. Per-slice / per-y-layer granularity only.
+  if (onProgress) onProgress(0.02)
+  const scanProgress = (dirIdx: number, slice: number, slices: number): number =>
+    0.02 + 0.7 * ((dirIdx + slice / slices) / 6)
 
   const buckets: Record<SegmentName, Builder> = {
     opaque: newBuilder(),
@@ -819,6 +831,7 @@ export function extractSurface(
       }
       sweep(blockMask, false, s)
       sweep(waterMask, true, s)
+      if (onProgress) onProgress(scanProgress(dirIdx, s + 1, nd))
     }
   }
 
@@ -869,6 +882,7 @@ export function extractSurface(
         }
       }
     }
+    if (onProgress && y + 1 < dy) onProgress(0.72 + 0.28 * ((y + 1) / dy))
   }
 
   // Concatenate buckets in fixed order, remapping indices per vertex base.
@@ -909,6 +923,7 @@ export function extractSurface(
     indexOffset += src.length
   }
 
+  if (onProgress) onProgress(1)
   return {
     positions,
     normals,

@@ -4,8 +4,14 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { api, ApiError } from '../api'
 import { atlasTileSpan, loadAssets } from '../render/assets'
-import { decodePreview } from '../render/decode'
-import { extractSurface, type MeshData } from '../render/surface'
+import {
+  asMeshResponse,
+  buildMeshRequest,
+  runMeshPipeline,
+  type MeshData,
+  type MeshResult,
+} from '../render/meshWorker'
+import type { AssetBundle } from '../types'
 import { applyTiledAtlas } from '../render/tiledMaterial'
 import BrandLoader from './BrandLoader.vue'
 
@@ -15,8 +21,31 @@ const container = ref<HTMLDivElement>()
 const loading = ref(true)
 const error = ref('')
 const faceCount = ref(0)
+/** 0..1 decode+mesh fraction while loading; null shows the plain loader. */
+const progress = ref<number | null>(null)
 
 let dispose: (() => void) | null = null
+/** Live mesh worker, if one is mid-flight (terminated on dispose). */
+let activeWorker: Worker | null = null
+/** Bumped by every render start and every stop: an in-flight render whose
+ * captured epoch no longer matches was superseded (schematic switch,
+ * unmount) and must die quietly instead of falling back inline. */
+let renderEpoch = 0
+
+/** The worker infrastructure failed (construction, onerror, stall) and the
+ * caller must retry inline. Pipeline errors — the OOM guardrails — are
+ * ordinary Errors and never take the fallback, which would re-run the
+ * doomed pipeline on the main thread. */
+class WorkerUnavailable extends Error {}
+
+/** Render superseded (unmount / schematic switch) — dropped silently. */
+class RenderSuperseded extends Error {}
+
+/** No worker message (progress included) for this long → assume the worker
+ * is wedged and fall back to the main thread. Progress arrives at
+ * per-slice/per-y-layer granularity, so a healthy pipeline ticks far
+ * inside this budget; the timeout mainly guards module-load failures. */
+const WORKER_STALL_MS = 30_000
 
 /** Geometry for one draw range, sharing the merged attribute arrays. */
 function rangeGeometry(mesh: MeshData, range: { start: number; count: number }): THREE.BufferGeometry {
@@ -34,27 +63,106 @@ function rangeGeometry(mesh: MeshData, range: { start: number; count: number }):
   return geometry
 }
 
+/** Decode + mesh in the worker. Resolves with the transferred mesh;
+ * rejects with WorkerUnavailable when the worker path cannot be trusted,
+ * or with the pipeline's own Error (guardrails) for the error overlay. */
+function meshViaWorker(
+  gz: ArrayBuffer,
+  bundle: AssetBundle | null,
+  onProgress: (pct: number) => void,
+): Promise<MeshResult> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker
+    try {
+      worker = new Worker(new URL('../render/meshWorker.ts', import.meta.url), { type: 'module' })
+    } catch {
+      reject(new WorkerUnavailable('mesh worker construction failed'))
+      return
+    }
+    activeWorker = worker
+    let settled = false
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    const settle = (outcome: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(watchdog)
+      worker.terminate() // one-shot worker: done, errored or wedged alike
+      if (activeWorker === worker) activeWorker = null
+      outcome()
+    }
+    const fail = (err: Error): void => settle(() => reject(err))
+    const armWatchdog = (): void => {
+      clearTimeout(watchdog)
+      watchdog = setTimeout(() => fail(new WorkerUnavailable('mesh worker stalled')), WORKER_STALL_MS)
+    }
+    worker.onerror = () => fail(new WorkerUnavailable('mesh worker failed'))
+    worker.onmessage = (event: MessageEvent) => {
+      const msg = asMeshResponse(event.data)
+      if (!msg) return
+      if (msg.type === 'progress') {
+        onProgress(msg.pct)
+        armWatchdog()
+      } else if (msg.type === 'done') {
+        settle(() => resolve({ mesh: msg.mesh, dims: msg.dims }))
+      } else {
+        fail(new Error(msg.message))
+      }
+    }
+    armWatchdog()
+    // The payload stays cloned (fixtures are KBs–MBs); no input transfer,
+    // so the inline fallback below still owns its copy after a failure.
+    worker.postMessage(buildMeshRequest(gz, bundle))
+  })
+}
+
+/** Worker first; on infrastructure failure run the identical pipeline
+ * inline. Progress may restart from a lower percentage — it is an honest
+ * re-run, not a continuation. Superseded renders never re-run at all. */
+async function meshWithFallback(
+  gz: ArrayBuffer,
+  bundle: AssetBundle | null,
+  onProgress: (pct: number) => void,
+  stale: () => boolean,
+): Promise<MeshResult> {
+  try {
+    return await meshViaWorker(gz, bundle, onProgress)
+  } catch (e) {
+    if (!(e instanceof WorkerUnavailable)) throw e
+    if (stale()) throw new RenderSuperseded()
+    return runMeshPipeline(gz, bundle, onProgress)
+  }
+}
+
 async function render() {
   if (!container.value) return
+  const epoch = ++renderEpoch
+  const stale = (): boolean => epoch !== renderEpoch
   loading.value = true
   error.value = ''
   faceCount.value = 0
+  progress.value = null
 
   const width = container.value.clientWidth
   const height = container.value.clientHeight
 
-  // 1. Fetch + decode the RLE preview data.
+  // 1. Fetch the gzipped RLE preview data.
   const resp = await fetch(api.previewUrl(props.schematicId))
   if (!resp.ok) throw new ApiError(resp.status, '预览数据加载失败')
-  const gz = new Uint8Array(await resp.arrayBuffer())
-  const grid = decodePreview(gz)
+  if (stale()) throw new RenderSuperseded()
+  const gz = await resp.arrayBuffer()
 
-  // 2. Resolve the render bundle (null keeps the flat-color fallback).
+  // 2. Resolve the render bundle (null keeps the flat-color fallback);
+  //    the main thread still loads the atlas texture for the materials.
   const store = await loadAssets()
+  if (stale()) throw new RenderSuperseded()
 
-  // 3. Mesh: vanilla model quads with cull groups, AO and tint baked into
-  //    vertex colors; opaque / cutout / translucent / flat draw ranges.
-  const mesh = extractSurface(grid, store)
+  // 3. Decode + mesh off the main thread (inline fallback on worker
+  //    failure); vanilla model quads with cull groups, AO and tint baked
+  //    into vertex colors; opaque / cutout / translucent / flat ranges.
+  const { mesh, dims } = await meshWithFallback(gz, store?.bundle ?? null, (pct) => {
+    progress.value = pct
+  }, stale)
+  if (stale()) throw new RenderSuperseded()
   faceCount.value = mesh.faceCount
 
   // 4. Build the three.js scene.
@@ -114,7 +222,7 @@ async function render() {
   scene.add(dir)
 
   // 5. Frame the schematic: center the bounding box and step back.
-  const [dx, dy, dz] = grid.dims
+  const [dx, dy, dz] = dims
   const center = new THREE.Vector3(dx / 2, dy / 2, dz / 2)
   const radius = Math.max(dx, dy, dz) / 2 || 1
   camera.position.set(
@@ -171,38 +279,52 @@ async function render() {
   }
 }
 
+/** Tear down one render cycle: scene resources plus any in-flight worker.
+ * Invalidates the epoch so superseded renders die instead of falling
+ * back inline. */
+function stopRender(): void {
+  renderEpoch++
+  activeWorker?.terminate()
+  activeWorker = null
+  dispose?.()
+  dispose = null
+}
+
+/** Shared catch: superseded renders are silent, everything else (guardrail
+ * Chinese errors included) reaches the overlay verbatim. */
+function reportError(e: unknown): void {
+  if (e instanceof RenderSuperseded) return
+  error.value = e instanceof Error ? e.message : '预览渲染失败'
+}
+
 onMounted(async () => {
   try {
     await render()
   } catch (e) {
-    error.value = e instanceof Error ? e.message : '预览渲染失败'
+    reportError(e)
   }
 })
 
 watch(
   () => props.schematicId,
   async () => {
-    dispose?.()
-    dispose = null
+    stopRender()
     try {
       await render()
     } catch (e) {
-      error.value = e instanceof Error ? e.message : '预览渲染失败'
+      reportError(e)
     }
   },
 )
 
-onBeforeUnmount(() => {
-  dispose?.()
-  dispose = null
-})
+onBeforeUnmount(stopRender)
 </script>
 
 <template>
   <div class="viewer-shell">
     <div ref="container" style="width: 100%; height: 100%"></div>
     <div v-if="loading" class="viewer-overlay">
-      <BrandLoader />
+      <BrandLoader :text="progress !== null ? `加载中… ${Math.round(progress * 100)}%` : undefined" />
     </div>
     <div v-else-if="error" class="viewer-overlay viewer-error">{{ error }}</div>
     <div v-else class="viewer-tip">拖拽旋转 · 滚轮缩放 · 右键平移</div>

@@ -40,8 +40,16 @@ const utf8 = new TextDecoder()
  * RLE order matches the backend iteration: x fastest, then z, then y.
  * Runs are parsed into one flat interleaved Uint32Array per region and
  * expanded row-by-row with data.fill — never a per-voxel JS loop.
+ *
+ * `onProgress`, when given, receives a 0..1 fraction: once after the
+ * gunzip + header, then per y layer crossed during RLE expansion and per
+ * region completed (coarse granularity; no per-voxel calls). Omitting it
+ * keeps the behavior and hot-loop cost of the callback-free path.
  */
-export function decodePreview(gzBytes: Uint8Array): VoxelGrid {
+export function decodePreview(
+  gzBytes: Uint8Array,
+  onProgress?: (fraction: number) => void,
+): VoxelGrid {
   const buf = gunzipSync(gzBytes)
   let off = 0
 
@@ -109,6 +117,12 @@ export function decodePreview(gzBytes: Uint8Array): VoxelGrid {
   }
 
   const regionCount = uvarint()
+  // Progress: gunzip + header done (5%), region expansion the rest. The
+  // y cursor inside each region gives continuous feedback between region
+  // boundaries; single-region payloads (the common case) still tick.
+  const regionProgress = (r: number, frac = 0): number =>
+    0.05 + (0.95 * (r + Math.min(1, Math.max(0, frac)))) / Math.max(regionCount, 1)
+  if (onProgress) onProgress(0.05)
   for (let r = 0; r < regionCount; r++) {
     const name = text(uvarint())
     const px = zigzag()
@@ -184,11 +198,14 @@ export function decodePreview(gzBytes: Uint8Array): VoxelGrid {
           if (++z === az) {
             z = 0
             y++
+            // One callback per y layer, never per row or voxel.
+            if (onProgress && y < ay) onProgress(regionProgress(r, y / ay))
           }
         }
         remaining -= take
       }
     }
+    if (onProgress) onProgress(regionProgress(r + 1))
   }
 
   return { dims: [dx, dy, dz], palette, data }

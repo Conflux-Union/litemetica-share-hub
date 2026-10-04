@@ -6,27 +6,26 @@
  * (resolveStateGeometry) and the mesher (tile transforms, alpha classes,
  * biome tint colors). Any failure resolves null and the viewer keeps its
  * flat-color fallback mode.
+ *
+ * The pure bundle derivations live in render/bundle.ts (shared with the
+ * mesh worker); this module re-exports them and adds the three.js parts
+ * (texture loading, sRGB).
  */
 
 import * as THREE from 'three'
 import { gunzipSync } from 'fflate'
-import type { AlphaClass, AssetBundle, BundleModel, SpriteRef } from '../types'
-import type { BlockstateJson, ModelJson, VanillaAssets } from './model'
-import { DEFAULT_TINT_COLORS, setTintColors, type Rgb } from './tint'
+import type { AlphaClass, AssetBundle } from '../types'
+import type { VanillaAssets } from './model'
+import {
+  bundleTintColors,
+  buildVanillaAssets,
+  makeLookups,
+  type BundleLookups,
+  type TileTransform,
+} from './bundle'
+import { setTintColors, type Rgb } from './tint'
 
-/**
- * Atlas mapping for one tile: `atlasU = u0 + du * modelU`,
- * `atlasV = v0 + dv * modelV` with model uv in 0..16 texture space (v
- * growing down from the tile's top edge). dv is negative because atlas v
- * grows upwards under THREE's flipY convention. A half-texel inset keeps
- * sampling inside the tile.
- */
-export interface TileTransform {
-  u0: number
-  du: number
-  v0: number
-  dv: number
-}
+export * from './bundle'
 
 export interface AssetStore {
   bundle: AssetBundle
@@ -73,89 +72,6 @@ export function computeAtlasUv(
     tileOrigin.u0 + fract((localUv[0] / 16) * shrink) * span,
     tileOrigin.v0 - fract((localUv[1] / 16) * shrink) * span,
   ]
-}
-
-/**
- * Map bundle blockstate keys ("minecraft:block/<name>") to state-name keys
- * ("minecraft:<name>") so resolveStateGeometry finds them by state name;
- * original keys are kept too for tolerant lookup.
- */
-export function normalizeBlockStates(
-  states: Record<string, BlockstateJson>,
-): Record<string, BlockstateJson> {
-  const out: Record<string, BlockstateJson> = {}
-  for (const [key, json] of Object.entries(states)) {
-    out[key] = json
-    const mapped = /^([^:]+):block\/(.+)$/.exec(key)
-    if (mapped) {
-      const stateKey = `${mapped[1]}:${mapped[2]}`
-      if (!(stateKey in out)) out[stateKey] = json
-    }
-  }
-  return out
-}
-
-/**
- * Unwrap one wire model: 26.x texture values may be sprite objects
- * ({sprite, force_translucent}); the model layer expects plain strings.
- * force_translucent is dropped — the mesher buckets by the bundle's
- * server-side alpha class. Elements pass through verbatim (trusted wire
- * data from our own extractor); the cast only narrows their loose type.
- */
-export function normalizeModel(model: BundleModel): ModelJson {
-  const { textures, ...rest } = model
-  if (!textures) return rest as ModelJson
-  const flat: Record<string, string> = {}
-  for (const [key, value] of Object.entries(textures)) {
-    flat[key] = typeof value === 'string' ? value : (value as SpriteRef).sprite
-  }
-  return { ...rest, textures: flat } as unknown as ModelJson
-}
-
-/**
- * Precompute per-texture atlas transforms. Model uv space is always 0..16
- * (vanilla), regardless of the tile pixel size.
- */
-export function buildTileTransforms(bundle: AssetBundle): Map<string, TileTransform> {
-  const { grid, tile } = bundle
-  const ts = 1 / grid
-  const inset = 0.5 / (grid * tile)
-  const span = ts - 2 * inset
-  const out = new Map<string, TileTransform>()
-  for (const [id, entry] of Object.entries(bundle.textures)) {
-    const [col, row] = entry.uv
-    out.set(id, {
-      u0: col * ts + inset,
-      du: span / 16,
-      v0: 1 - row * ts - inset,
-      dv: -span / 16,
-    })
-  }
-  return out
-}
-
-/**
- * Namespace-tolerant texture-id resolution: atlas keys are always
- * fully-qualified, but 26.x model files reference textures both
- * namespaced ("minecraft:block/snow") and bare ("block/stone" — the
- * repeater/comparator/brewing-stand family). Bare ids read as
- * "minecraft:<id>"; ids that already carry a namespace pass through.
- */
-export function resolveTextureId(bundle: AssetBundle, id: string): string {
-  return id in bundle.textures || id.includes(':') ? id : `minecraft:${id}`
-}
-
-/** Bundle lookups shared by the viewer mesher, the icon renderer and
- * tests; both are namespace-tolerant via {@link resolveTextureId}. */
-export function makeLookups(bundle: AssetBundle): {
-  tileTransform: AssetStore['tileTransform']
-  alphaClass: AssetStore['alphaClass']
-} {
-  const transforms = buildTileTransforms(bundle)
-  return {
-    tileTransform: (id) => transforms.get(resolveTextureId(bundle, id)) ?? null,
-    alphaClass: (id) => bundle.textures[resolveTextureId(bundle, id)]?.alpha ?? 'opaque',
-  }
 }
 
 function isUsableBundle(bundle: AssetBundle): boolean {
@@ -213,28 +129,9 @@ async function fetchAssets(): Promise<AssetStore | null> {
   texture.generateMipmaps = false
   texture.colorSpace = THREE.SRGBColorSpace
 
-  const assets: VanillaAssets = {
-    blockStates: normalizeBlockStates(bundle.blockStates as Record<string, BlockstateJson>),
-    // Item models join the model map so flattenModel can walk parent
-    // chains across block and item models (keys never collide).
-    blockModels: {
-      ...Object.fromEntries(
-        Object.entries(bundle.blockModels).map(([id, model]) => [id, normalizeModel(model)]),
-      ),
-      ...Object.fromEntries(
-        Object.entries(bundle.itemModels ?? {}).map(([id, model]) => [id, normalizeModel(model)]),
-      ),
-    },
-  }
-  const lookups = makeLookups(bundle)
-
-  const toRgb = (v: [number, number, number]): Rgb => [v[0] / 255, v[1] / 255, v[2] / 255]
-  const tintColors = {
-    grass: bundle.tintColors.grass ? toRgb(bundle.tintColors.grass) : DEFAULT_TINT_COLORS.grass,
-    foliage: bundle.tintColors.foliage
-      ? toRgb(bundle.tintColors.foliage)
-      : DEFAULT_TINT_COLORS.foliage,
-  }
+  const assets = buildVanillaAssets(bundle)
+  const lookups: BundleLookups = makeLookups(bundle)
+  const tintColors = bundleTintColors(bundle)
   // Keep resolveTint's module palette in sync with the loaded bundle.
   setTintColors(tintColors)
 
