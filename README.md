@@ -1,4 +1,4 @@
-# Litemetica Share Hub
+# Litematica Share Hub
 
 Share and preview [Litematica](https://modrinth.com/mod/litematica) schematics (`.litematic`) online.
 
@@ -36,7 +36,7 @@ cp config.example.toml config.toml
 
 # 3. Build & run
 cd backend && cargo build --release
-cd .. && ./backend/target/release/litemetica-share-hub
+cd .. && ./backend/target/release/Litematica-share-hub
 ```
 
 Development mode: run the backend (`cargo run`), then `npm run dev` in `frontend/`
@@ -49,11 +49,11 @@ building:
 
 ```bash
 # Downloads the client jar from Mojang's official piston-meta endpoint
-./backend/target/release/litemetica-share-hub extract-textures
+./backend/target/release/Litematica-share-hub extract-textures
 
 # Or pin a version / use a local jar:
-./backend/target/release/litemetica-share-hub extract-textures --version 1.21.4
-./backend/target/release/litemetica-share-hub extract-textures --jar /path/to/client.jar
+./backend/target/release/Litematica-share-hub extract-textures --version 1.21.4
+./backend/target/release/Litematica-share-hub extract-textures --jar /path/to/client.jar
 ```
 
 The command extracts `assets/minecraft/textures/block/*.png`, resolves
