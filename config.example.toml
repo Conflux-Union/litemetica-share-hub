@@ -2,7 +2,7 @@
 
 listen = "0.0.0.0:8080"
 data_dir = "data"
-site_name = "Litemetica Share Hub"
+site_name = "Litematica Share Hub"
 
 [sso]
 base_url = "https://sso.cxu.org.cn"

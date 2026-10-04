@@ -1181,7 +1181,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "litemetica-share-hub"
+name = "litematica-share-hub"
 version = "0.1.0"
 dependencies = [
  "axum",

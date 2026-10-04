@@ -37,7 +37,7 @@ const bundleAvailable = existsSync(BUNDLE_PATH)
 if (!bundleAvailable) {
   console.info(
     `[bundle-coverage] skipping all tests: ${BUNDLE_PATH} does not exist. ` +
-      'Regenerate it with: backend/target/debug/litemetica-share-hub ' +
+      'Regenerate it with: backend/target/debug/litematica-share-hub ' +
       'extract-textures --jar data/client.jar',
   )
 }

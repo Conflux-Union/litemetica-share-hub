@@ -22,7 +22,7 @@ function goLogin() {
 <template>
   <zhimo-navbar>
     <span slot="brand" style="font-weight: 700; cursor: pointer" @click="$router.push('/')">
-      {{ state.config?.site_name ?? 'Litemetica Share Hub' }}
+      {{ state.config?.site_name ?? 'Litematica Share Hub' }}
     </span>
     <div slot="actions" class="user-chip">
       <zhimo-button variant="ghost" @click="$router.push('/upload')" v-if="state.user">

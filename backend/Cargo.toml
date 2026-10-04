@@ -1,11 +1,11 @@
 [package]
-name = "litemetica-share-hub"
+name = "litematica-share-hub"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 
 [[bin]]
-name = "litemetica-share-hub"
+name = "litematica-share-hub"
 path = "src/main.rs"
 
 [dependencies]

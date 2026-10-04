@@ -110,7 +110,7 @@ async fn client_jar_url(version: &str) -> Result<String, String> {
 
 async fn stateless_http_get(url: &str) -> Result<Vec<u8>, String> {
     let http = reqwest::Client::builder()
-        .user_agent("litemetica-share-hub")
+        .user_agent("litematica-share-hub")
         .build()
         .map_err(|e| e.to_string())?;
     let resp = http.get(url).send().await.map_err(|e| e.to_string())?;

@@ -84,7 +84,7 @@ async fn main() {
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: litemetica-share-hub [serve] | extract-textures [--version X] [--jar PATH] | regen-previews"
+                "usage: litematica-share-hub [serve] | extract-textures [--version X] [--jar PATH] | regen-previews"
             );
             std::process::exit(2);
         }
@@ -119,7 +119,7 @@ async fn serve() {
         db: db.clone(),
         storage,
         http: reqwest::Client::builder()
-            .user_agent("litemetica-share-hub")
+            .user_agent("litematica-share-hub")
             .build()
             .expect("reqwest client"),
     };
